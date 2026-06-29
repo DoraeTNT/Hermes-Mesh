@@ -1,0 +1,27 @@
+[Unit]
+Description=Hermes GUI Bridge v4
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/hermes_gui_agent
+EnvironmentFile=/home/admin/.hermes/.env
+ExecStart=/home/admin/.local/bin/python3.11 /home/admin/hermes_gui_agent/bridge_v4.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-bridge
+
+# 安全加固
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/admin/hermes_gui_agent
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

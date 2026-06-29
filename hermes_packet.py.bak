@@ -1,0 +1,256 @@
+"""
+hermes_packet — 统一数据包规范
+所有 Bridge ↔ Agent 通信使用此格式。
+
+协议版本: 1
+变更历史:
+  v1 (2026-06-26): 初始规范
+    - packet_id (UUID) 全局唯一追踪
+    - timestamp + expire 防重放
+    - ACK 两阶段确认
+    - Agent Capability 握手
+"""
+
+import uuid
+import time
+import json
+import logging
+
+# ── 协议版本 ──
+PROTOCOL_VERSION = 1
+
+# ── Agent 版本（notfound config.py）──
+try:
+    import config
+    AGENT_VERSION = config.AGENT_VERSION
+except ImportError:
+    AGENT_VERSION = "4.1"  # fallback for Windows standalone
+
+# ── 日志 ──
+logger = logging.getLogger("hermes.packet")
+
+# ── Packet 类型 ──
+class PacketType:
+    # 命令相关
+    COMMAND   = "command"    # Bridge → Agent: 执行命令
+    ACK       = "ack"        # Agent → Bridge: 已收到命令
+    DONE      = "done"       # Agent → Bridge: 命令执行完成
+    ERROR     = "error"      # Agent → Bridge: 命令执行失败
+
+    # 心跳
+    PING      = "ping"       # Bridge → Agent
+    PONG      = "pong"       # Agent → Bridge
+
+    # 握手
+    CHALLENGE      = "challenge"       # Bridge → Agent
+    AUTH_RESPONSE ="auth_response"  # Agent → Bridge
+    BLACKLISTED    = "blacklisted"     # Bridge → Agent
+
+
+# ── Packet 构建 ──
+def new_packet_id() -> str:
+    """生成全局唯一 packet_id"""
+    return uuid.uuid4().hex[:12]
+
+
+def make_command(action: str, params: dict = None, session: str = "",
+                 expire_seconds: int = 300) -> dict:
+    """Bridge 构建命令包"""
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.COMMAND,
+        "packet_id": new_packet_id(),
+        "action": action,
+        "params": params or {},
+        "session": session,
+        "timestamp": time.time(),
+        "expire": time.time() + expire_seconds,
+        "retry": 0,
+    }
+
+
+def make_ack(packet_id: str) -> dict:
+    """Agent 构建 ACK 包（已收到，开始执行）"""
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.ACK,
+        "packet_id": packet_id,
+        "timestamp": time.time(),
+    }
+
+
+def make_done(packet_id: str, result: dict) -> dict:
+    """Agent 构建 Done 包（执行完成）"""
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.DONE,
+        "packet_id": packet_id,
+        "result": result,
+        "timestamp": time.time(),
+    }
+
+
+def make_error(packet_id: str, error: str) -> dict:
+    """Agent 构建 Error 包（执行失败）"""
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.ERROR,
+        "packet_id": packet_id,
+        "error": error,
+        "timestamp": time.time(),
+    }
+
+
+def make_ping() -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.PING,
+        "timestamp": time.time(),
+    }
+
+
+def make_pong() -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.PONG,
+        "timestamp": time.time(),
+    }
+
+
+def make_challenge(challenge_hex: str) -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.CHALLENGE,
+        "challenge": challenge_hex,
+    }
+
+
+def make_auth_response(response_hex: str, hostname: str, device_id: str,
+                       device_name: str, capabilities: list = None) -> dict:
+    """Agent 构建认证响应，包含能力列表"""
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.AUTH_RESPONSE,
+        "response": response_hex,
+        "hostname": hostname,
+        "device_id": device_id,
+        "device_name": device_name,
+        "capabilities": capabilities or [],
+        "agent_version": AGENT_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+    }
+
+
+def make_blacklisted(reason: str) -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.BLACKLISTED,
+        "reason": reason,
+    }
+
+
+# ── Packet 解析 ──
+def parse_packet(raw: bytes) -> dict:
+    """解析原始字节为 Packet dict，自动解码"""
+    return json.loads(raw)
+
+
+def encode_packet(packet: dict) -> bytes:
+    """编码 Packet 为字节"""
+    return json.dumps(packet, ensure_ascii=False).encode()
+
+
+def get_packet_type(packet: dict) -> str:
+    """获取包类型，兼容旧协议（无 type 字段）"""
+    return packet.get("type", "")
+
+
+def is_expired(packet: dict) -> bool:
+    """检查命令是否已过期"""
+    expire = packet.get("expire", 0)
+    return expire > 0 and time.time() > expire
+
+
+def is_legacy(packet: dict) -> bool:
+    """检查是否为旧协议包（无 v 字段）"""
+    return "v" not in packet
+
+
+# ── 向后兼容：旧协议 → 新协议 ──
+def upgrade_legacy_command(msg: dict) -> dict:
+    """将旧版 Bridge 命令包升级为新格式
+    
+    旧格式: {"id": "1", "action": "click", "params": {...}}
+    新格式: {"v": 1, "type": "command", "packet_id": "...", ...}
+    """
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.COMMAND,
+        "packet_id": msg.get("id", new_packet_id()),
+        "legacy_id": msg.get("id"),  # 保留旧 ID 用于回包匹配
+        "action": msg.get("action", ""),
+        "params": msg.get("params", {}),
+        "session": "",
+        "timestamp": time.time(),
+        "expire": time.time() + 300,
+        "retry": 0,
+    }
+
+
+def upgrade_legacy_response(msg: dict) -> dict:
+    """将旧版 Agent 回包升级为新格式
+    
+    旧格式: {"id": "1", "result": {...}}
+    新格式: {"v": 1, "type": "done", "packet_id": "...", "result": {...}}
+    """
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": PacketType.DONE,
+        "packet_id": msg.get("id", ""),
+        "legacy_id": msg.get("id"),
+        "result": msg.get("result", {}),
+        "timestamp": time.time(),
+    }
+
+
+# ── Capability 常量 ──
+class Capability:
+    SCREENSHOT = "screenshot"
+    CLICK      = "click"
+    MOVE       = "move"
+    DRAG       = "drag"
+    KEYBOARD   = "keyboard"
+    TYPE_TEXT   = "type_text"
+    KEY        = "key"
+    PRESS      = "press"
+    SCROLL     = "scroll"
+    CMD        = "cmd"
+    CLIPBOARD  = "clipboard"
+    DOWNLOAD   = "download"
+    OPEN_URL   = "open_url"
+    FILE       = "file"
+
+    # 平台标识
+    WINDOWS    = "platform:windows"
+    LINUX      = "platform:linux"
+    MACOS      = "platform:macos"
+    ANDROID    = "platform:android"
+
+
+# 默认 Windows Agent 能力列表
+DEFAULT_WINDOWS_CAPABILITIES = [
+    Capability.SCREENSHOT,
+    Capability.CLICK,
+    Capability.MOVE,
+    Capability.DRAG,
+    Capability.KEYBOARD,
+    Capability.TYPE_TEXT,
+    Capability.KEY,
+    Capability.PRESS,
+    Capability.SCROLL,
+    Capability.CMD,
+    Capability.CLIPBOARD,
+    Capability.DOWNLOAD,
+    Capability.OPEN_URL,
+    Capability.WINDOWS,
+]
