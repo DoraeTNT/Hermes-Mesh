@@ -1,0 +1,47 @@
+2026-07-02 23:44:33 | device=? | run_command: dir /b "C:\Users\%USERNAME%\Desktop"
+2026-07-02 23:44:34 | device=? | run_command: powershell -Command "Get-ChildItem -Path $env:USERPROFILE\Desktop | Select-Object Name"
+2026-07-02 23:44:36 | device=? | run_command: powershell -Command "Get-ChildItem -Path ([Environment]::GetFolderPath('Desktop')) | ForEach-Object { $_.Name }"
+2026-07-02 23:44:37 | device=? | run_command: powershell -Command "Write-Host '桌面路径:'; Write-Host ([Environment]::GetFolderPath('Desktop')); Write-Host '桌面文件:'; Get-ChildItem ([Environment]::GetFolderPath('Desktop')) -Name"
+2026-07-02 23:52:59 | device=? | run_command: echo %USERNAME%
+2026-07-02 23:53:01 | device=? | run_command: python --version
+2026-07-02 23:53:03 | device=? | run_command: python -c "import openpyxl; print('ok')"
+2026-07-02 23:53:04 | device=? | run_command: pip install openpyxl -q
+2026-07-02 23:53:23 | device=? | run_command: python -c "
+import openpyxl
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = '示例表格'
+
+# 设置表头
+headers = ['姓名', '年龄', '部门', '工资']
+ws.append(headers)
+
+# 添加数据
+data = [
+    ['张三', 28, '技术部', 12000],
+    ['李四', 32, '市场部', 15000],
+    ['王五', 25, '人事部', 9000],
+    ['赵六', 35, '财务部', 18000],
+]
+for row in dat
+2026-07-02 23:53:24 | device=? | run_command: dir C:\Users\Doraemon\Desktop\示例表格.xlsx
+2026-07-02 23:53:25 | device=? | run_command: dir C:\Users\Doraemon\Desktop
+2026-07-02 23:53:27 | device=? | run_command: dir C:\Users\Doraemon\
+2026-07-02 23:53:29 | device=? | run_command: dir C:\Users\Public\Desktop
+2026-07-02 23:53:32 | device=? | run_command: python -c "
+import openpyxl
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = '示例表格'
+
+headers = ['姓名', '年龄', '部门', '工资']
+ws.append(headers)
+
+data = [
+    ['张三', 28, '技术部', 12000],
+    ['李四', 32, '市场部', 15000],
+    ['王五', 25, '人事部', 9000],
+    ['赵六', 35, '财务部', 18000],
+]
+for row in data:
+    ws.appe

@@ -21,7 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hermes.chat")
 
-import config
+from collections import defaultdict, deque
+
+from hermes import server_config as config
 # ── 速率限制 ──
 class RateLimiter:
     """简单滑动窗口速率限制器，每个 IP 独立计数"""
@@ -285,7 +287,11 @@ def execute_tool(tool_name, args, device_id=None):
 
     return json.dumps({"error": f"unknown tool: {tool_name}"}), []
 
-def chat_with_tools(messages, max_rounds=5, device_id=None):
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "50"))
+
+def chat_with_tools(messages, max_rounds=None, device_id=None):
+    if max_rounds is None:
+        max_rounds = MAX_TOOL_ROUNDS
     all_images = []
     for round_num in range(max_rounds):
         payload = json.dumps({
@@ -343,6 +349,9 @@ class ChatHandler(BaseHTTPRequestHandler):
     def _check_rate_limit(self):
         """检查请求频率，超过限制返回 429 Too Many Requests"""
         client_ip = self.client_address[0]
+        # 本地回环和私有地址绕过速率限制
+        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+            return True
         if not rate_limiter.is_allowed(client_ip):
             self.send_error(429, "Too Many Requests")
             return False

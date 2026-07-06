@@ -14,7 +14,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hermes.threat")
 
-import config
+from collections import defaultdict, deque
+
+from hermes import server_config as config
 # ── 速率限制 ──
 class RateLimiter:
     """简单滑动窗口速率限制器，每个 IP 独立计数"""
@@ -115,6 +117,9 @@ class ThreatHandler(BaseHTTPRequestHandler):
     def _check_rate_limit(self):
         """检查请求频率，超过限制返回 429 Too Many Requests"""
         client_ip = self.client_address[0]
+        # 本地回环和私有地址绕过速率限制
+        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+            return True
         if not rate_limiter.is_allowed(client_ip):
             self.send_error(429, "Too Many Requests")
             return False

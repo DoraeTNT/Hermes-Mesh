@@ -17,8 +17,11 @@ from socketserver import ThreadingMixIn
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-import config
-import hermes_packet as pkt
+from hermes import server_config as config
+from hermes import packet as pkt
+
+# ── Stream 处理线程池（避免 feed_stream 阻塞事件循环）──
+_stream_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="stream")
 
 # ── 统一日志 ──
 # 日志配置由 config.py 统一初始化，此处只需获取 logger
@@ -223,18 +226,33 @@ class TCPServer:
                     break
                 data = await reader.readexactly(length)
                 msg = pkt.parse_packet(data)
+                msg_type = msg.get("type", "")
 
                 # 心跳
                 if msg.get("type") == pkt.PacketType.PONG:
                     conn.last_pong = time.time()
                     continue
 
+                # ── 视频流（无 packet_id，异步推流）──
+                if msg.get("type") == "stream":
+                    try:
+                        import base64 as _b64
+                        from hermes.stream_manager import feed_stream
+                        ts_data = _b64.b64decode(msg.get("data", ""))
+                        did = conn.device_id
+                        # 线程池执行，避免 FFmpeg 管道阻塞事件循环
+                        _stream_executor.submit(feed_stream, did, ts_data)
+                    except Exception as e:
+                        logger.warning("STREAM error: %s", e)
+                    continue
+
                 # 协议包处理
                 packet_id = msg.get("packet_id")
-                msg_type = msg.get("type", "")
 
-                logger.info("RECV type=%s pid=%s keys=%s", msg_type,
-                           (packet_id or "None")[:8], list(msg.keys()))
+                # 调试：记录非 stream/ack/done 消息类型
+                if msg_type not in ("ack", "done", ""):
+                    logger.info("MSG type=%s pid=%s", msg_type,
+                               (packet_id or "None")[:8])
 
                 if not packet_id:
                     continue
@@ -410,13 +428,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/health":
+        # 通用：解析 query string
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p) if qs else {}
+        path_base = self.path.split("?")[0]
+
+        if path_base == "/health":
             uptime = int(time.time() - bridge_started)
             with tcp_server.lock:
                 count = len(tcp_server.agents)
             self._json({"status": "ok", "uptime": uptime, "agents": count,
                         "version": "5.0", "protocol": pkt.PROTOCOL_VERSION})
-        elif self.path in ("/status", "/devices"):
+        elif path_base in ("/status", "/devices"):
             with tcp_server.lock:
                 devs = {did: conn.stats() for did, conn in tcp_server.agents.items()}
             self._json({
@@ -428,6 +451,60 @@ class APIHandler(BaseHTTPRequestHandler):
                 "version": "5.0",
                 "protocol": pkt.PROTOCOL_VERSION,
             })
+        elif path_base == "/stream-meta":
+            # fMP4 init segment + codec info
+            import base64
+            device_id = params.get("device_id", "")
+            if not device_id:
+                self._json({"error": "device_id required"}, 400)
+                return
+            from hermes.stream_manager import get_or_create_stream
+            session = get_or_create_stream(device_id)
+            init = session.get_init()
+            if not init:
+                self._json({"error": "stream not ready (no init segment)"}, 503)
+                return
+            self._json({
+                "codec": session.codec,
+                "init_b64": base64.b64encode(init).decode(),
+                "active": session.active,
+            })
+        elif path_base == "/stream-sse":
+            # SSE 视频流
+            import base64
+            device_id = params.get("device_id", "")
+            if not device_id:
+                self._json({"error": "device_id required"}, 400)
+                return
+            from hermes.stream_manager import get_or_create_stream
+            session = get_or_create_stream(device_id)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            session.client_count += 1
+            last_id = 0
+            try:
+                while session.active or len(session.segments) > 0:
+                    segments = session.get_segments_since(last_id)
+                    for sid, data in segments:
+                        b64 = base64.b64encode(data).decode()
+                        try:
+                            self.wfile.write(f"data: {b64}\n\n".encode())
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            raise
+                        last_id = max(last_id, sid)
+                    if not segments:
+                        time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                session.client_count = max(0, session.client_count - 1)
         else:
             self._json({"error": "not found"}, 404)
 

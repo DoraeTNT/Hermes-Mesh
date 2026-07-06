@@ -1,0 +1,14 @@
+{
+  "agent": {
+    "version": "4.5",
+    "changelog": "v4.5: Phase1 runtime layer - CmdSession + retry"
+  },
+  "chat": {
+    "version": "2.2",
+    "changelog": "v2.2: 初始版本"
+  },
+  "unified": {
+    "version": "3.21",
+    "changelog": "v3.21: bump streamer v1.2"
+  }
+}

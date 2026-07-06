@@ -15,7 +15,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hermes.dashboard")
 
-import config
+from collections import defaultdict, deque
+
+from hermes import server_config as config
 # ── 速率限制 ──
 class RateLimiter:
     """简单滑动窗口速率限制器，每个 IP 独立计数"""
@@ -133,6 +135,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _check_rate_limit(self):
         """检查请求频率，超过限制返回 429 Too Many Requests"""
         client_ip = self.client_address[0]
+        # 本地回环和私有地址绕过速率限制（nginx 反代时所有请求都来自 127.0.0.1）
+        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+            return True
         if not rate_limiter.is_allowed(client_ip):
             self.send_error(429, "Too Many Requests")
             return False
@@ -164,7 +169,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_auth(self):
-        """验证 API 认证（X-Api-Key 头 或 api_key 查询参数）"""
+        """验证 API 认证，/api/health 和主页免认证"""
+        path_base = self.path.split("?")[0]
+        if path_base in ("/", "/index.html", "/api/health", "/api/devices", "/api/events"):
+            return True
         api_key = self.headers.get("X-Api-Key", "")
         # 也支持 URL 查询参数（MJPEG 流等场景无法自定义 header）
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -245,48 +253,99 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(img_bytes)
             else:
                 self._json(result)
-        elif path_base.startswith("/api/stream"):
-            # MJPEG 视频流: GET /api/stream?device_id=xxx&fps=2
+        elif path_base == "/api/stream-start":
+            # 下发 stream_start 命令给 Agent
             qs = self.path.split("?", 1)[1] if "?" in self.path else ""
             params = dict(p.split("=") for p in qs.split("&") if "=" in p) if qs else {}
             device_id = params.get("device_id", "")
-            quality = int(params.get("quality", 30))
-            fps = float(params.get("fps", 2))
-            interval = 1.0 / max(fps, 0.5)
+            fps = params.get("fps", "20")
+            bitrate = params.get("bitrate", "2M")
             if not device_id:
                 self._json({"error": "device_id required"}, 400)
                 return
-            import base64 as b64mod
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=--FRAME")
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            boundary = b"--FRAME\r\n"
+            # 下发命令给 Agent（bridge 的 feed_stream 会自动启动服务端 FFmpeg）
+            result = bridge_signed_call("stream_start", {
+                "fps": int(fps),
+                "bitrate": bitrate,
+            }, device_id=device_id, timeout=10)
+            self._json(result)
+        elif path_base == "/api/stream-meta":
+            # 代理到 Bridge（stream_manager 状态在 Bridge 进程中）
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            meta_url = f"{BRIDGE_URL}/stream-meta?{qs}"
             try:
+                resp = urllib.request.urlopen(meta_url, timeout=10)
+                data = json.loads(resp.read())
+                self._json(data)
+            except Exception as e:
+                self._json({"error": str(e)}, 502)
+        elif path_base == "/api/sse-test":
+            # 简单 SSE 测试：每秒发一个计数器
+            import time as _time
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            count = 0
+            try:
+                while count < 30:
+                    self.wfile.write(f"data: test message {count}\n\n".encode())
+                    self.wfile.flush()
+                    count += 1
+                    _time.sleep(1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif path_base == "/api/stream-sse":
+            # SSE 代理到 Bridge（raw socket）
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            import socket as _sock
+            s = None
+            try:
+                s = _sock.create_connection(("127.0.0.1", config.BRIDGE_HTTP_PORT), timeout=10)
+                s.sendall(f"GET /stream-sse?{qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode())
+                # ... (bridge communication is internal)
+                # 响应浏览器时使用 HTTP/1.1
+                self.protocol_version = "HTTP/1.1"
+                # 读取 bridge 响应头
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = s.recv(4096)
+                    if not chunk: break
+                    buf += chunk
+                header_end = buf.index(b"\r\n\r\n") + 4
+                body_tail = buf[header_end:]
+                # 发送 SSE 响应头
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                # 立刻发送一个心跳确保连接
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                # 转发 body
+                if body_tail:
+                    self.wfile.write(body_tail)
+                    self.wfile.flush()
+                s.settimeout(0.5)  # 500ms 超时避免永久阻塞
                 while True:
                     try:
-                        result = bridge_signed_call("screenshot", {"quality": quality}, device_id=device_id, timeout=10)
-                        if "data" in result:
-                            img_bytes = b64mod.b64decode(result["data"])
-                            self.wfile.write(boundary)
-                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                            self.wfile.write(f"Content-Length: {len(img_bytes)}\r\n\r\n".encode())
-                            self.wfile.write(img_bytes)
-                            self.wfile.write(b"\r\n")
-                        else:
-                            # 错误也发一帧
-                            err = result.get("error", "unknown")
-                            self.wfile.write(boundary)
-                            self.wfile.write(b"Content-Type: text/plain\r\n")
-                            self.wfile.write(f"Content-Length: {len(err)}\r\n\r\n".encode())
-                            self.wfile.write(err.encode())
-                            self.wfile.write(b"\r\n")
-                    except Exception:
-                        time.sleep(1)
-                    time.sleep(interval)
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # 客户端断开
+                        chunk = s.recv(65536)
+                        if not chunk: break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except _sock.timeout:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        continue
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            except Exception as e:
+                self._json({"error": str(e)}, 502)
+            finally:
+                if s:
+                    try: s.close()
+                    except: pass
         else:
             self._json({"error": "not found"}, 404)
 
@@ -426,9 +485,9 @@ th{color:#8b949e;font-weight:500;font-size:11px;text-transform:uppercase}
       <button id="livePauseBtn" onclick="togglePause()" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 10px;font-size:12px;cursor:pointer;font-family:inherit;display:none">⏸ 暂停</button>
     </div>
     <div class="card-body" style="text-align:center;min-height:200px">
-      <img id="liveImage" src="" style="max-width:100%;max-height:500px;display:none;border-radius:4px;border:1px solid #30363d" alt="视频流">
-      <div id="livePlaceholder" style="color:#484f58;padding:60px 0">选择设备后开始视频流<br><small style="color:#30363d">MJPEG 实时视频</small></div>
-      <div id="liveError" style="color:#f85149;display:none;padding:20px"></div>
+      <video id="liveVideo" style="max-width:100%;max-height:500px;display:none;border-radius:4px;border:1px solid #30363d" muted autoplay playsinline></video>
+      <div id="livePlaceholder" style="color:#484f58;padding:60px 0">选择设备后开始 H.264 实时视频流<br><small style="color:#30363d">需要 FFmpeg (gdigrab + MSE)</small></div>
+      <div id="liveError" style="color:#f85149;display:none;padding:20px;font-size:13px"></div>
     </div>
   </div>
 
@@ -462,14 +521,16 @@ th{color:#8b949e;font-weight:500;font-size:11px;text-transform:uppercase}
   </div>
 
 </div>
+<!-- v20260704-2 -->
 <div class="refresh-indicator" id="refreshInfo">自动刷新: 5s | 上次: --</div>
 
 <script>
-const BASE = window.location.pathname.replace(/\\/+$/, '');
+const DEFAULT_API_KEY = "";
+const BASE = window.location.pathname.replace(/\/+$/, '');
 const API = BASE + '/api';
 // 从 URL 参数读取 API Key（例如 /dashboard/?key=xxx）
 const urlParams = new URLSearchParams(window.location.search);
-const API_KEY = urlParams.get('key') || '';
+const API_KEY = urlParams.get('api_key') || (typeof DEFAULT_API_KEY!=='undefined'?DEFAULT_API_KEY:'');
 
 async function fetchJSON(url) {
   try {
@@ -511,36 +572,235 @@ async function disconnectDevice(id, name) {
   }
 }
 
-// ── 实时画面 (MJPEG 视频流) ──
+// ── 实时画面 (H.264 MSE 视频流) ──
 let liveDeviceId = '';
-let liveStreamUrl = '';
+let mediaSource = null;
+let sourceBuffer = null;
+let eventSource = null;
+let initSegment = null;
+let frameCount = 0;
+let fpsTimer = 0;
+let mseReady = false;
 
 function startLiveView() {
   const sel = document.getElementById('liveDevice');
   const newId = sel.value;
   if (!newId) { stopLiveView(); return; }
+
+  if (liveDeviceId && liveDeviceId !== newId) {
+    stopLiveView();
+  }
   liveDeviceId = newId;
-  const img = document.getElementById('liveImage');
+
+  const video = document.getElementById('liveVideo');
   const placeholder = document.getElementById('livePlaceholder');
   const errEl = document.getElementById('liveError');
   const fpsEl = document.getElementById('liveFPS');
   const pauseBtn = document.getElementById('livePauseBtn');
-  liveStreamUrl = API + '/stream?device_id=' + newId + '&fps=3&quality=25' + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
-  img.src = liveStreamUrl;
-  img.style.display = 'block';
-  placeholder.style.display = 'none';
+
+  // 显示进度
+  placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 1/4: 发送 stream_start 命令</small>';
+  placeholder.style.display = 'block';
   errEl.style.display = 'none';
-  fpsEl.textContent = '~3 FPS';
-  pauseBtn.style.display = 'inline-block';
-  pauseBtn.textContent = '⏸ 暂停';
+
+  // 发送 stream_start 命令给 Agent
+  const streamStartUrl = API + '/stream-start?device_id=' + newId + '&fps=20&bitrate=2M' + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
+  fetch(streamStartUrl).catch(() => {});
+
+  // 获取 init segment（带重试，因为 -c copy 的 init 需要等待 TS 数据来修补 avc1）
+  placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 2/4: 获取 init segment</small>';
+  const metaUrl = API + '/stream-meta?device_id=' + newId + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
+  
+  // Retry fetch: init segment may need time for TS-based avc1 patching
+  let metaRetries = 0;
+  const maxMetaRetries = 80;  // 80 * 250ms = 20 seconds max
+  
+  function fetchMeta() {
+    return fetch(metaUrl).then(r => r.json()).then(meta => {
+      if (meta.error) {
+        metaRetries++;
+        if (metaRetries < maxMetaRetries) {
+          placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 2/4: 等待 init segment (' + metaRetries + '/' + maxMetaRetries + ')</small>';
+          return new Promise(resolve => setTimeout(resolve, 250)).then(fetchMeta);
+        }
+        throw new Error(meta.error);
+      }
+      return meta;
+    });
+  }
+  
+  fetchMeta()
+    .then(meta => {
+      if (meta.error) {
+        placeholder.style.display = 'none';
+        errEl.textContent = 'Stream error: ' + meta.error;
+        errEl.style.display = 'block';
+        throw new Error(meta.error);
+      }
+      placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 3/4: 初始化 MSE (' + (meta.init_b64 ? meta.init_b64.length : 0) + ' bytes init)</small>';
+      return setupMSE(video, meta);
+    })
+    .then(() => {
+      placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 4/4: 连接 SSE 视频流</small>';
+      // 连接 SSE 获取 fMP4 segments
+      const sseUrl = API + '/stream-sse?device_id=' + newId + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
+      eventSource = new EventSource(sseUrl);
+      eventSource.onopen = () => {
+        fpsEl.textContent = 'SSE open';
+        placeholder.innerHTML = '视频流已连接，等待数据...<br><small style="color:#3fb950">SSE connected, waiting for segments</small>';
+      };
+      eventSource.onmessage = (e) => {
+        try {
+          fpsEl.textContent = 'got msg';
+          if (!sourceBuffer || sourceBuffer.updating) { fpsEl.textContent = 'sb busy'; return; }
+          if (!mseReady) { fpsEl.textContent = 'waiting MSE'; return; }
+          let binary = atob(e.data);
+          let bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          sourceBuffer.appendBuffer(bytes);
+          frameCount++;
+          fpsEl.textContent = 'Frames: ' + frameCount;
+          if (!fpsTimer) fpsTimer = performance.now();
+          if (video.paused) video.play().catch(() => {});
+          if (placeholder.style.display !== 'none') {
+            video.style.display = 'block';
+            placeholder.style.display = 'none';
+            pauseBtn.style.display = 'inline-block';
+            pauseBtn.textContent = '⏸ 暂停';
+          }
+          // Force seek to buffered range if video is stuck at t=0 with data elsewhere
+          if (video.readyState < 2 && sourceBuffer && sourceBuffer.buffered.length > 0) {
+            const start = sourceBuffer.buffered.start(0);
+            if (Math.abs(video.currentTime - start) > 0.5) {
+              video.currentTime = start;
+            }
+            // Explicitly trigger play after seek
+            video.play().catch(() => {});
+          }
+        } catch(ex) {
+          errEl.textContent = 'Segment error: ' + ex.message;
+          errEl.style.display = 'block';
+          placeholder.style.display = 'none';
+        }
+      };
+      eventSource.onerror = (ev) => {
+        placeholder.style.display = 'none';
+        errEl.textContent = 'SSE connection lost — reconnecting...';
+        errEl.style.display = 'block';
+      };
+
+      // FPS 计数器
+      setInterval(() => {
+        if (frameCount > 0 && fpsTimer) {
+          const elapsed = (performance.now() - fpsTimer) / 1000;
+          const fps = Math.round(frameCount / elapsed);
+          fpsEl.textContent = '~' + fps + ' FPS';
+        }
+      }, 2000);
+    })
+    .catch(err => {
+      placeholder.style.display = 'none';
+      errEl.innerHTML = '<b>H.264 stream failed:</b><br>' + (err.message || err) +
+        '<br><small style="color:#484f58">Check: FFmpeg on Windows client, stream active on server.</small>';
+      errEl.style.display = 'block';
+    });
+}
+
+async function setupMSE(video, meta) {
+  const initB64 = meta.init_b64;
+  if (!initB64 || !window.MediaSource) {
+    throw new Error('Browser does not support MediaSource Extensions');
+  }
+  const binary = atob(initB64);
+  initSegment = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) initSegment[i] = binary.charCodeAt(i);
+
+  return new Promise((resolve, reject) => {
+    mediaSource = new MediaSource();
+    video.src = URL.createObjectURL(mediaSource);
+    video.load();  // 强制开始加载
+    let resolved = false;
+    mediaSource.addEventListener('sourceopen', () => {
+      try {
+        // Comprehensive H.264 codec list — video-only + audio variants
+        const codecs = [
+          'video/mp4; codecs="avc1.42E01E"',
+          'video/mp4; codecs="avc1.42c028"',
+          'video/mp4; codecs="avc1.4D401E"',
+          'video/mp4; codecs="avc1.64001E"',
+          'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+          'video/mp4; codecs="avc1.42c028, mp4a.40.2"',
+          'video/mp4; codecs="avc1.4D401E, mp4a.40.2"',
+          'video/mp4; codecs="avc1.64001E, mp4a.40.2"',
+        ];
+        let mime = null;
+        for (const c of codecs) {
+          if (MediaSource.isTypeSupported(c)) { mime = c; break; }
+        }
+        if (!mime) {
+          reject(new Error('No supported H.264 codec found'));
+          return;
+        }
+        sourceBuffer = mediaSource.addSourceBuffer(mime);
+        sourceBuffer.mode = 'sequence';
+        sourceBuffer.addEventListener('updateend', () => {
+          mseReady = true;
+          if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+            const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            const start = sourceBuffer.buffered.start(0);
+            if (end - start > 5) {
+              try { sourceBuffer.remove(start, end - 3); } catch(e) {}
+            }
+          }
+          // resolve only after init segment is fully processed
+          if (!resolved) { resolved = true; resolve(); }
+        });
+        sourceBuffer.addEventListener('error', (e) => {
+          const errEl = document.getElementById('liveError');
+          errEl.textContent = 'MSE sourceBuffer error — codec or init segment mismatch';
+          errEl.style.display = 'block';
+          console.error('sourceBuffer error:', e);
+          if (!resolved) { resolved = true; reject(new Error('sourceBuffer error')); }
+        });
+        sourceBuffer.appendBuffer(initSegment);
+        // NOTE: do NOT resolve here — wait for 'updateend' to ensure MSE is ready
+      } catch(e) {
+        if (!resolved) { resolved = true; reject(e); }
+      }
+    });
+    mediaSource.addEventListener('sourceclose', () => {
+      mseReady = false;
+      mediaSource = null;
+      sourceBuffer = null;
+    });
+    mediaSource.addEventListener('sourceended', () => {
+      mseReady = false;
+    });
+    // Timeout: if sourceopen doesn't fire in 10s, reject
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        reject(new Error('MediaSource sourceopen timeout'));
+      }
+    }, 10000);
+  });
 }
 
 function stopLiveView() {
   liveDeviceId = '';
-  liveStreamUrl = '';
-  const img = document.getElementById('liveImage');
-  img.src = '';
-  img.style.display = 'none';
+
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (mediaSource && mediaSource.readyState === 'open') {
+    try { mediaSource.endOfStream(); } catch(e) {}
+  }
+  mediaSource = null;
+  sourceBuffer = null;
+  initSegment = null;
+  mseReady = false;
+
+  const video = document.getElementById('liveVideo');
+  video.src = '';
+  video.style.display = 'none';
   document.getElementById('livePlaceholder').style.display = 'block';
   document.getElementById('liveError').style.display = 'none';
   document.getElementById('liveFPS').textContent = '';
@@ -548,16 +808,13 @@ function stopLiveView() {
 }
 
 function togglePause() {
-  const img = document.getElementById('liveImage');
+  const video = document.getElementById('liveVideo');
   const btn = document.getElementById('livePauseBtn');
-  if (img.src && img.src !== window.location.href) {
-    // 暂停：清空 src 但保留当前帧（先记住 url）
-    liveStreamUrl = img.src;
-    img.src = '';
+  if (!video.paused) {
+    video.pause();
     btn.textContent = '▶ 播放';
   } else {
-    // 恢复
-    img.src = liveStreamUrl;
+    video.play();
     btn.textContent = '⏸ 暂停';
   }
 }

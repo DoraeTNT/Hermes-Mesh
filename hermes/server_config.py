@@ -76,7 +76,7 @@ if _missing_keys:
 AGENT_VERSION = "4.1"
 
 # ── LLM ──
-LLM_API_KEY      = get("LLM_API_KEY", "") or CHAT_API_KEY  # 优先专用密钥，回退到通用密钥
+LLM_API_KEY      = get("LLM_API_KEY", "") or get("DEEPSEEK_API_KEY", "") or CHAT_API_KEY  # 优先专用密钥，回退到通用密钥
 LLM_BASE_URL     = get("CHAT_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL        = get("CHAT_MODEL", "deepseek-v4-flash")
 
@@ -107,10 +107,11 @@ VERSIONS_FILE    = os.path.join(UPDATE_DIR, "versions.json")
 # ── 安全 ──
 UPLOAD_MAX_SIZE  = int(get("UPLOAD_MAX_SIZE", str(100 * 1024 * 1024)))  # 100MB
 UPLOAD_WHITELIST = set(get("UPLOAD_WHITELIST",
-    "HermesUnified.exe,hermes_unified.py,HermesAgent.exe,windows_agent_v4.py,"
-    "updater.py,chat_client.py,HermesChat.exe,main_agent.py,"
+    "HermesUnified.exe,HermesAgent.exe,HermesChat.exe,WarehouseMS.exe,"
+    "client/agent.py,client/unified.py,client/updater.py,client/gen_tls_certs.py,"
     "hermes/config.py,hermes/updater.py,hermes/agent.py,hermes/chat.py,hermes/main.py,hermes/__init__.py,"
-    "modules.json,WarehouseMS.exe").split(","))
+    "hermes/server_config.py,hermes/packet.py,"
+    "modules.json").split(","))
 
 # ── 速率限制 ──
 # 每个 IP 每窗口最大请求数，窗口大小（秒）

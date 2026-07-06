@@ -23,10 +23,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hermes.agent")
 
-# ── Config ──
-HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
+# ── Config（通过加密加载器，环境变量优先）──
+try:
+    from crypto_loader import get_config
+    HOST = get_config("SERVER_HOST", "")
+    UPDATE_SERVER = get_config("UPDATE_URL", "")
+    SECRET = get_config("SHARED_SECRET", "")
+except ImportError:
+    # 回退：未加密模式（开发/调试）
+    HOST = os.environ.get("BRIDGE_HOST", "")
+    UPDATE_SERVER = os.environ.get("UPDATE_SERVER", "")
+    SECRET = os.environ.get("SHARED_SECRET", "")
+
 PORT = int(os.environ.get("BRIDGE_TCP_PORT", "25917"))
-SECRET = os.environ.get("SHARED_SECRET", "")
 
 RECONNECT_BASE = 3
 RECONNECT_MAX  = 60
@@ -42,8 +51,6 @@ PROTOCOL_VERSION = 1
 # ── Blacklist flag ──
 BLACKLIST_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".blacklisted")
 
-# ── Self-update ──
-UPDATE_SERVER = os.environ.get("UPDATE_SERVER", "http://127.0.0.1:3658")
 VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".version")
 # ── 版本号：与 config.AGENT_VERSION 保持一致（canonical source: config.py）──
 # Agent 独立运行在 Windows，无法导入 config.py，此处为同步副本
@@ -105,10 +112,27 @@ CAPABILITIES = [
     "screenshot", "click", "move", "drag", "keyboard",
     "type_text", "key", "press", "scroll", "cmd",
     "clipboard", "download", "open_url", "platform:windows",
+    "stream",
 ]
 
 # ── Thread Pool ──
 executor = ThreadPoolExecutor(max_workers=CMD_WORKERS, thread_name_prefix="cmd")
+
+# ── Socket send lock (线程安全：streamer 线程和主线程共享 socket) ──
+_send_lock = threading.Lock()
+
+# ── Streamer (lazy import) ──
+_streamer = None
+
+def _get_streamer():
+    global _streamer
+    if _streamer is None:
+        try:
+            import streamer as _mod
+            _streamer = _mod
+        except ImportError:
+            logger.warning("[STREAM] streamer module not found")
+    return _streamer
 
 # ── Download Tracking ──
 _downloads = {}
@@ -117,7 +141,8 @@ _dl_lock = threading.Lock()
 # ── Network ──
 def send_msg(sock, data):
     if isinstance(data, str): data = data.encode()
-    sock.sendall(struct.pack(">I", len(data)) + data)
+    with _send_lock:
+        sock.sendall(struct.pack(">I", len(data)) + data)
 
 def recv_msg(sock):
     hdr = sock.recv(4)
@@ -224,15 +249,21 @@ def _is_safe_cmd(cmd: str) -> bool:
             return False
     return True
 
-def do_cmd(cmd, timeout=60):
-    # 注入防护检查
+def do_cmd(cmd, timeout=60, session=False):
+    """执行命令。session=True 使用持久 cmd 会话（保持环境变量/cwd）"""
     if not _is_safe_cmd(cmd):
         logger.warning("CMD blocked: contains dangerous characters: %s", cmd[:100])
         return {"type": "cmd", "error": "command contains dangerous characters (blocked for security)"}
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                          timeout=timeout, errors='replace')
-        return {"type": "cmd", "stdout": p.stdout, "stderr": p.stderr, "exit_code": p.returncode}
+        if session:
+            from runtime import get_cmd_session
+            s = get_cmd_session()
+            result = s.run(cmd, timeout=timeout)
+            return {"type": "cmd", **result}
+        else:
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=timeout, errors='replace')
+            return {"type": "cmd", "stdout": p.stdout, "stderr": p.stderr, "exit_code": p.returncode}
     except subprocess.TimeoutExpired:
         return {"type": "cmd", "error": "timeout", "cmd": cmd[:100]}
     except Exception as e:
@@ -409,10 +440,40 @@ def do_open_url(url):
     except Exception as e:
         return {"error": str(e)}
 
+# ── Stream handlers ──
+def do_stream_start(params):
+    m = _get_streamer()
+    if not m:
+        return {"error": "streamer module not available (FFmpeg required)"}
+    # 从当前 socket 获取引用（agent_main 里面连接的 sock）
+    sock = getattr(do_stream_start, '_sock', None)
+    if not sock:
+        return {"error": "socket not ready (agent not connected)"}
+    return m.start_stream(
+        sock=sock,
+        sock_lock=_send_lock,
+        fps=params.get("fps", 20),
+        bitrate=params.get("bitrate", "2M"),
+        width=params.get("width", 0),
+        height=params.get("height", 0),
+    )
+
+def do_stream_stop():
+    m = _get_streamer()
+    if not m:
+        return {"error": "streamer module not available"}
+    return m.stop_stream()
+
+def do_stream_status():
+    m = _get_streamer()
+    if not m:
+        return {"error": "streamer module not available"}
+    return m.stream_status()
+
 # ── Handler Registry ──
 HANDLERS = {
     "screenshot": lambda p: do_screenshot(p.get("region"), p.get("quality")),
-    "cmd": lambda p: do_cmd(p.get("cmd",""), p.get("timeout",60)),
+    "cmd": lambda p: do_cmd(p.get("cmd",""), p.get("timeout",60), p.get("session", False)),
     "download": lambda p: do_download(p.get("url",""), p.get("filename")),
     "download_status": lambda p: do_download_status(p.get("task_id")),
     "click": lambda p: do_click(p.get("x",0), p.get("y",0)),
@@ -425,6 +486,9 @@ HANDLERS = {
     "type_text": lambda p: do_type_text(p.get("text","")),
     "key": lambda p: do_key(p.get("code",0)),
     "open_url": lambda p: do_open_url(p.get("url","")),
+    "stream_start": lambda p: do_stream_start(p),
+    "stream_stop": lambda p: do_stream_stop(),
+    "stream_status": lambda p: do_stream_status(),
 }
 
 
@@ -446,17 +510,18 @@ def agent_main():
         return
 
     if os.path.exists(BLACKLIST_FLAG):
-        logger.error("✖ 黑名单标记存在 (%s)，退出。删除此文件后重试。", BLACKLIST_FLAG)
+        logger.error("[BLACKLIST] Local blacklist found (%s), remove this file to retry.", BLACKLIST_FLAG)
         return
 
-    if check_self_update():
-        import subprocess
-        this_file = os.path.abspath(__file__)
-        logger.info("UPDATE 重启 Agent: %s", this_file)
-        time.sleep(1)
-        subprocess.Popen([sys.executable, this_file],
-                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        return
+    if not hasattr(sys.modules[__name__], '_in_launcher'):
+        if check_self_update():
+            import subprocess
+            this_file = os.path.abspath(__file__)
+            logger.info("UPDATE 重启 Agent: %s", this_file)
+            time.sleep(1)
+            subprocess.Popen([sys.executable, this_file],
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            return
 
     delay = RECONNECT_BASE
     stats = {"connects": 0, "commands": 0, "errors": 0}
@@ -477,7 +542,7 @@ def agent_main():
                 first_msg = None
 
             if first_msg and first_msg.get("type") == "blacklisted":
-                logger.error("✖ 已被服务器拉黑: %s", first_msg.get('reason', 'unknown'))
+                logger.error("[BLACKLIST] Server blacklisted this agent: %s", first_msg.get('reason', 'unknown'))
                 try:
                     open(BLACKLIST_FLAG, "w").write(first_msg.get("reason", "blacklisted"))
                 except Exception:
@@ -492,6 +557,10 @@ def agent_main():
             delay = RECONNECT_BASE
             consecutive_failures = 0
             sock.settimeout(65)
+            # 注入 socket 引用给 streamer
+            do_stream_start._sock = sock
+            if hasattr(sys.modules[__name__], '_on_status'):
+                _on_status(True)
             logger.info("AGENT Connected #%d | Commands: %d", stats['connects'], stats['commands'])
 
             while True:
@@ -545,6 +614,8 @@ def agent_main():
         except Exception as e:
             stats["errors"] += 1
             consecutive_failures += 1
+            if hasattr(sys.modules[__name__], '_on_status'):
+                _on_status(False)
             logger.error("AGENT Disconnected: %s | Retry %ds | Failures: %d/%d",
                         e, delay, consecutive_failures, MAX_RECONNECT_ATTEMPTS)
 
@@ -560,7 +631,7 @@ def agent_main():
                 delay = min(delay * 2, RECONNECT_MAX)
 
 if __name__ == "__main__":
-    logger.info("INIT Agent v%s | %s:%d | %s (%s) | caps=%d",
+    logger.info("INIT Agent v%s | [SERVER]:%d | %s (%s) | caps=%d",
                 CURRENT_VERSION, HOST, PORT, DEVICE_NAME, DEVICE_ID, len(CAPABILITIES))
     logger.info("INIT ThreadPool: %d workers | Reconnect: %d-%ds | MaxAttempts: %d | Cooldown: %ds",
                 CMD_WORKERS, RECONNECT_BASE, RECONNECT_MAX, MAX_RECONNECT_ATTEMPTS, RECONNECT_COOLDOWN)

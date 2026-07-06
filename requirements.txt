@@ -1,0 +1,12 @@
+# Hermes GUI Agent — Server-side dependencies
+# Install: pip install -r requirements.txt
+
+# Core (stdlib alternatives or enhanced)
+# No core deps — most modules use stdlib only
+
+# Optional / Build
+pyinstaller>=6.0          # Client .exe packaging
+Pillow>=10.0              # Screenshot handling
+
+# Client-side (Windows only, included in PyInstaller bundle)
+# tkinter — bundled with Python on Windows

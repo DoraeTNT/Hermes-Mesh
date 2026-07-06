@@ -22,21 +22,51 @@ if sys.platform == "win32" and getattr(sys, "frozen", False):
     sys.stderr = _null
 
 # ── 版本 ──
-VERSION = "3.1"
+# Hardcoded fallback version. Hot update writes version.txt with the server-provided
+# version during do_restart(). We read version.txt first so the UI displays the actual
+# updated version, not the stale hardcoded value. This also prevents infinite update
+# loops: without this, VERSION stays at the hardcoded value and check_update() always
+# thinks an update is needed.
+_HARDCODED_VERSION = "3.13"
 
-# ── 热更新 ──
-SERVER_URL = "http://127.0.0.1:80"
+def _get_version():
+    try:
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        ver_file = os.path.join(base_dir, "version.txt")
+        if os.path.exists(ver_file):
+            with open(ver_file) as f:
+                ver = f.read().strip()
+            if ver:
+                return ver
+    except:
+        pass
+    return _HARDCODED_VERSION
+
+VERSION = _get_version()
+
+# ── 热更新（加密配置 / 环境变量）──
+try:
+    from crypto_loader import get_config, get_api_key
+    SERVER_URL = get_config("SERVER_URL", "")
+    API_KEY = get_api_key()
+except ImportError:
+    SERVER_URL = ""
+    API_KEY = ""
+
 VERSION_URL = f"{SERVER_URL}/unified_version.json"
-API_KEY = os.environ.get("CHAT_API_KEY", "")
+
 
 # 启动时检查：API_KEY 为空或使用默认值时发出警告
 _DEFAULT_API_KEY = ""
 if not API_KEY:
     import warnings as _warnings
-    _warnings.warn("⚠ CHAT_API_KEY 未设置，将以空密钥连接服务器")
+    _warnings.warn("[WARN] CHAT_API_KEY not set, connecting without key")
 elif API_KEY == _DEFAULT_API_KEY:
     import warnings as _warnings
-    _warnings.warn("⚠ 仍在使用默认 API_KEY，请通过环境变量 CHAT_API_KEY 设置自定义密钥")
+    _warnings.warn("[WARN] Using default API_KEY, set CHAT_API_KEY env var")
 
 # ── Agent 状态（线程共享） ──
 agent_status = {
@@ -78,9 +108,100 @@ def hide_console():
 # ── 热更新 v3（语义版本 + SHA256 + 外部 updater）──
 update_queue = queue.Queue(maxsize=5)
 
+# ── 模块级热更新（内联，不依赖 hermes.updater）──
+MODULES_JSON_URL = f"{SERVER_URL}/modules/modules.json"
+
 def _parse_ver(v):
     import re
     return tuple(int(p) for p in re.findall(r'\d+', str(v))) or (0,)
+
+def _check_modules():
+    """对比 modules.json，返回需要更新的模块列表"""
+    import urllib.request, json
+    try:
+        req = urllib.request.Request(MODULES_JSON_URL, headers={"X-Api-Key": API_KEY})
+        resp = urllib.request.urlopen(req, timeout=10)
+        remote = json.loads(resp.read())
+    except Exception:
+        return []
+
+    base_dir = get_base_dir()
+    local_path = os.path.join(base_dir, "modules", "modules.json")
+    local = {}
+    if os.path.exists(local_path):
+        try:
+            with open(local_path) as f:
+                local = json.load(f)
+        except:
+            pass
+
+    updates = []
+    for mod_name, info in remote.get("modules", {}).items():
+        remote_ver = info.get("version", "0")
+        local_ver = local.get(mod_name, {}).get("version", "0")
+        if _parse_ver(remote_ver) > _parse_ver(local_ver):
+            updates.append({
+                "name": mod_name,
+                "version": remote_ver,
+                "path": info["path"],
+                "url": info["url"],
+                "sha256": info.get("sha256", ""),
+            })
+    return updates
+
+def _download_modules(updates):
+    """下载更新的模块文件到本地，成功后保存版本并发送 ready 信号"""
+    import urllib.request, json
+    base_dir = get_base_dir()
+    any_updated = False
+    any_failed = False
+    latest_version = VERSION
+
+    for mod in updates:
+        dest = os.path.join(base_dir, mod["path"])
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        # 确保 hermes 包有 __init__.py
+        pkg_dir = os.path.dirname(dest)
+        if pkg_dir.endswith("hermes"):
+            init_file = os.path.join(pkg_dir, "__init__.py")
+            if not os.path.exists(init_file):
+                try:
+                    with open(init_file, "w") as f:
+                        f.write("# hermes\n")
+                except:
+                    pass
+
+        try:
+            urllib.request.urlretrieve(mod["url"], dest)
+            any_updated = True
+            latest_version = mod["version"]
+        except Exception as e:
+            any_failed = True
+
+    if not any_updated:
+        return False
+
+    # 保存本地 modules.json 防止重复下载
+    local_path = os.path.join(base_dir, "modules", "modules.json")
+    try:
+        local = {}
+        if os.path.exists(local_path):
+            with open(local_path) as f:
+                local = json.load(f)
+        for mod in updates:
+            local[mod["name"]] = {"version": mod["version"]}
+        with open(local_path, "w") as f:
+            json.dump(local, f)
+    except:
+        pass
+
+    # 只发一次 ready 信号
+    try:
+        update_queue.put_nowait({"status": "ready", "version": latest_version})
+    except:
+        pass
+    return not any_failed
 
 def _file_sha256(path):
     import hashlib
@@ -276,44 +397,28 @@ def download_update(info):
     remote_ver = info.get("version", "unknown")
     base_dir = get_base_dir()
     tmp_dir = _get_tmp_dir()
+    modules_dir = os.path.join(base_dir, "modules")
     
     # 记录版本号到 .update_ver
     _write_update_version(remote_ver, tmp_dir)
 
-    if getattr(sys, "frozen", False):
-        exe_url = info.get("exe_url", "")
-        if not exe_url:
-            return
-        tmp = os.path.join(tmp_dir, "HermesUnified_new.exe")
-        expected_sha = info.get("exe_sha256")
-        min_size = info.get("exe_size", 1024 * 1024)
-        min_size = max(1024, min_size // 2)
+    # 下载模块 .py 文件到 modules/ 目录（frozen 和非 frozen 都走这条路）
+    py_url = info.get("py_url", "")
+    if not py_url:
+        return
+    tmp = os.path.join(tmp_dir, "hermes_unified_new.py")
+    expected_sha = info.get("py_sha256")
 
-        try:
-            update_queue.put_nowait({"status": "downloading", "version": remote_ver})
-            ok, msg = _download_resumable(exe_url, tmp, expected_sha, min_size)
-            if not ok:
-                update_queue.put_nowait({"status": "error", "msg": f"下载失败: {msg}"})
-                return
-            update_queue.put_nowait({"status": "ready", "version": remote_ver, "tmp": tmp})
-        except Exception as e:
-            update_queue.put_nowait({"status": "error", "msg": str(e)[:80]})
-    else:
-        py_url = info.get("py_url", "")
-        if not py_url:
+    try:
+        update_queue.put_nowait({"status": "downloading", "version": remote_ver})
+        ok, msg = _download_resumable(py_url, tmp, expected_sha, 500)
+        if not ok:
+            update_queue.put_nowait({"status": "error", "msg": f"下载失败: {msg}"})
             return
-        tmp = os.path.join(tmp_dir, "hermes_unified_new.py")
-        expected_sha = info.get("py_sha256")
-
-        try:
-            update_queue.put_nowait({"status": "downloading", "version": remote_ver})
-            ok, msg = _download_resumable(py_url, tmp, expected_sha, 500)
-            if not ok:
-                update_queue.put_nowait({"status": "error", "msg": f"下载失败: {msg}"})
-                return
-            update_queue.put_nowait({"status": "ready", "version": remote_ver, "tmp": tmp})
-        except Exception as e:
-            update_queue.put_nowait({"status": "error", "msg": str(e)[:80]})
+        update_queue.put_nowait({"status": "ready", "version": remote_ver, "tmp": tmp,
+                                 "modules_dir": modules_dir})
+    except Exception as e:
+        update_queue.put_nowait({"status": "error", "msg": str(e)[:80]})
 
 def do_restart(info):
     """用户点击重启 → 启动外部 updater，然后退出当前进程"""
@@ -322,56 +427,40 @@ def do_restart(info):
     tmp = info.get("tmp", "")
     base_dir = get_base_dir()
 
-    if not tmp or not os.path.exists(tmp):
+    # 模块热更新：文件已在 modules/ 下，直接重启即可
+    if not tmp:
+        if getattr(sys, "frozen", False) and sys.platform == "win32":
+            os.startfile(sys.executable)
+        else:
+            os.execv(sys.executable, [sys.executable])
+        os._exit(0)
+        return
+
+    if not os.path.exists(tmp):
         update_queue.put_nowait({"status": "error", "msg": "更新文件不存在"})
         return
 
     if getattr(sys, "frozen", False):
-        # exe 模式：生成 .cmd 批处理来完成替换，无需 Python 解释器
-        current_exe = sys.executable
+        # 模块热更新：下载的 .py 替换到 modules/ 目录，重启 exe 加载新模块
+        modules_dir = info.get("modules_dir", os.path.join(base_dir, "modules"))
+        dest = os.path.join(modules_dir, "unified.py")
+        backup = os.path.join(modules_dir, "unified_bak.py")
         try:
-            cmd_path = os.path.join(base_dir, "_updater.cmd")
-            ver_file = os.path.join(base_dir, "version.txt")
-            # 把路径中的反斜杠转义供 .cmd 使用
-            def _cmd_esc(p):
-                return p.replace('"', '^"')
-            # 用列表逐行写入，避免转义地狱
-            cmd_lines = [
-                '@echo off',
-                'setlocal enabledelayedexpansion',
-                f'set OLD="{_cmd_esc(current_exe)}"',
-                f'set NEW="{_cmd_esc(tmp)}"',
-                f'set VER="{_cmd_esc(remote_ver)}"',
-                f'set VERFILE="{_cmd_esc(ver_file)}"',
-                'set TRIES=0',
-                ':retry',
-                'timeout /t 2 /nobreak >nul',
-                'move /y %OLD% %OLD%.bak >nul 2>&1',
-                'if errorlevel 1 (',
-                '    set /a TRIES+=1',
-                '    if !TRIES! lss 15 goto retry',
-                '    echo [UPDATER] Failed to replace after 30s, aborting.',
-                '    goto cleanup',
-                ')',
-                'move /y %NEW% %OLD% >nul 2>&1',
-                'echo %VER% > %VERFILE%',
-                'start "" %OLD%',
-                ':cleanup',
-                'del "%~f0"',
-            ]
-            with open(cmd_path, 'w', newline='') as cf:
-                import os as _os
-                _nl = _os.linesep
-                cf.write(_nl.join(cmd_lines) + _nl)
-            subprocess.Popen(
-                ["cmd", "/c", cmd_path],
-                close_fds=True,
-                creationflags=0x00000008 if sys.platform == "win32" else 0,
-                cwd=base_dir,
-            )
+            if os.path.exists(backup):
+                os.remove(backup)
+            if os.path.exists(dest):
+                os.replace(dest, backup)
+            os.replace(tmp, dest)
+            with open(os.path.join(base_dir, "version.txt"), "w") as f:
+                f.write(remote_ver)
+            # 重启 launcher
+            if sys.platform == "win32":
+                os.startfile(sys.executable)
+            else:
+                os.execv(sys.executable, [sys.executable])
             os._exit(0)
         except Exception as e:
-            update_queue.put_nowait({"status": "error", "msg": f"启动 updater 失败: {e}"})
+            update_queue.put_nowait({"status": "error", "msg": f"替换失败: {e}"})
     else:
         # .py 模式：直接替换
         final = os.path.join(base_dir, "hermes_unified.py")
@@ -419,12 +508,17 @@ def startup_update():
     
     # 否则执行在线检查
     def _bg():
+        # 旧的 unified 自更新
         need, ver, info = check_update()
         if need and info:
-            # 检查用户是否已跳过此版本
             skipped = _load_skipped_versions()
             if ver not in skipped:
                 download_update(info)
+        
+        # 新的模块级热更新（modules.json）
+        updates = _check_modules()
+        if updates:
+            _download_modules(updates)
     threading.Thread(target=_bg, daemon=True).start()
 
 class UpdateChecker:
@@ -442,6 +536,10 @@ class UpdateChecker:
                 need, ver, info = check_update()
                 if need and info:
                     download_update(info)
+                # 模块级热更新
+                updates = _check_modules()
+                if updates:
+                    _download_modules(updates)
             except:
                 pass
             self._stop.wait(600)
@@ -499,22 +597,20 @@ def agent_log(tag, msg):
             pass
 
 def run_agent():
-    sys.path.insert(0, get_base_dir())
+    base = get_base_dir()
+    sys.path.insert(0, os.path.join(base, "modules"))
+    sys.path.insert(0, base)
 
-    # #14: 检查 windows_agent_v4.py 是否存在
-    agent_path = os.path.join(get_base_dir(), "windows_agent_v4.py")
-    if not os.path.exists(agent_path) and not getattr(sys, "frozen", False):
-        agent_log("INIT", f"⚠ windows_agent_v4.py 不存在于 {get_base_dir()}")
-        return
-
-    import windows_agent_v4 as agent_mod
+    import agent as agent_mod
     agent_mod.log = agent_log
     agent_mod.log_err = lambda tag, msg: agent_log(f"{tag}:ERR", msg)
+    agent_mod._on_status = lambda v: agent_status.__setitem__("connected", v)
+    agent_mod._in_launcher = True  # 由 unified 热更新接管，跳过 agent 自更新
 
     agent_status["device_name"] = agent_mod.DEVICE_NAME
     agent_status["device_id"] = agent_mod.DEVICE_ID
 
-    agent_log("INIT", f"Agent v{agent_mod.CURRENT_VERSION} | Bridge:{agent_mod.HOST}:{agent_mod.PORT}")
+    agent_log("INIT", f"Agent v{agent_mod.CURRENT_VERSION} | Bridge: [SERVER]:{agent_mod.PORT}")
 
     # v1.1: 废弃 wrapped_main() 旧协议重复实现，直接调用 agent_main()
     # agent_main() 内置：ACK 两阶段确认 + 新旧协议兼容 + 黑名单处理 + 重连冷却
@@ -536,6 +632,10 @@ def run_chat():
     import tkinter as tk
     from tkinter import ttk, scrolledtext, font as tkfont
     import json, urllib.request, uuid
+
+    # ── 启动时检查模块热更新（launcher 模式下 if __name__ == \"__main__\" 不执行）──
+    startup_update()
+    UpdateChecker().start()
 
     try:
         from PIL import Image, ImageTk
@@ -573,11 +673,13 @@ def run_chat():
 
     def clear_history():
         try:
-            req = urllib.request.Request(CHAT_URL.replace("/chat", "/clear"), data=b"{}",
+            url = SERVER_URL.rstrip("/") + "/clear"
+            req = urllib.request.Request(url, data=b"{}",
                 headers={"Content-Type": "application/json", "X-Api-Key": API_KEY, "X-Device-Id": DEVICE_ID})
             urllib.request.urlopen(req, timeout=10)
             return True
-        except:
+        except Exception as e:
+            agent_log("CLEAR", f"清除失败: {e}")
             return False
 
     class ChatApp:
@@ -629,23 +731,17 @@ def run_chat():
             self.log_btn = tk.Button(header, text="日志", font=("Microsoft YaHei", 8),
                                       bg="#30363d", fg="#e6edf3", relief=tk.FLAT, padx=6,
                                       activebackground="#21262d", cursor="hand2",
-                                      command=self._toggle_logs)
+                                      command=self._open_log_window)
             self.log_btn.pack(side=tk.RIGHT, padx=2, pady=10)
 
             tk.Button(header, text="清除", font=("Microsoft YaHei", 8), bg="#21262d", fg="#8b949e",
                       relief=tk.FLAT, padx=6, activebackground="#30363d", cursor="hand2",
                       command=self._clear_chat).pack(side=tk.RIGHT, padx=2, pady=10)
 
-            self.log_frame = tk.Frame(self.root, bg="#0d1117", height=120)
-            self.log_frame.pack(fill=tk.X, padx=10, pady=(0, 0))
-            self.log_frame.pack_propagate(False)
-            self.log_text = tk.Text(self.log_frame, font=self.mono_font, bg="#161b22", fg="#8b949e",
-                                     relief=tk.FLAT, padx=8, pady=4, height=8, state=tk.DISABLED,
-                                     highlightbackground="#30363d", highlightthickness=1)
-            self.log_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-            self.log_text.tag_config("log_err", foreground="#f85149")
-            self.log_text.tag_config("log_ok", foreground="#3fb950")
-            self.log_text.tag_config("log_info", foreground="#58a6ff")
+            # 日志弹窗（按需创建）+ 环形缓冲区
+            self.log_window = None
+            self.log_text = None
+            self.log_buffer = []  # 保存最近 200 条日志
 
             chat_frame = tk.Frame(self.root, bg="#0d1117")
             chat_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 0))
@@ -679,13 +775,40 @@ def run_chat():
             tk.Label(self.root, textvariable=self.status_var, bg="#161b22", fg="#484f58",
                      font=("Consolas", 9), anchor=tk.W, padx=10).pack(fill=tk.X, side=tk.BOTTOM)
 
-        def _toggle_logs(self):
-            self.show_logs = not self.show_logs
-            if self.show_logs:
-                self.log_frame.pack(fill=tk.X, padx=10, pady=(0, 0), before=self.chat_area.master)
-                self.log_btn.configure(bg="#30363d", fg="#e6edf3")
-            else:
-                self.log_frame.pack_forget()
+        def _open_log_window(self):
+            if self.log_window is not None and tk.Toplevel.winfo_exists(self.log_window):
+                self.log_window.lift()
+                return
+            self.log_window = tk.Toplevel(self.root)
+            self.log_window.title("Hermes Agent Log")
+            self.log_window.geometry("600x400")
+            self.log_window.configure(bg="#0d1117")
+            self.log_window.protocol("WM_DELETE_WINDOW", self._close_log_window)
+
+            self.log_text = tk.Text(self.log_window, font=self.mono_font,
+                                     bg="#161b22", fg="#8b949e",
+                                     relief=tk.FLAT, padx=8, pady=4,
+                                     state=tk.DISABLED,
+                                     highlightbackground="#30363d", highlightthickness=1)
+            self.log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+            self.log_text.tag_config("log_err", foreground="#f85149")
+            self.log_text.tag_config("log_ok", foreground="#3fb950")
+            self.log_text.tag_config("log_info", foreground="#58a6ff")
+
+            # 回放缓冲区已有日志
+            for line, tag in self.log_buffer:
+                self.log_text.configure(state=tk.NORMAL)
+                self.log_text.insert(tk.END, line + "\n", tag)
+                self.log_text.configure(state=tk.DISABLED)
+            self.log_text.see(tk.END)
+
+            self.log_btn.configure(bg="#30363d", fg="#e6edf3")
+
+        def _close_log_window(self):
+            if self.log_window is not None:
+                self.log_window.destroy()
+                self.log_window = None
+                self.log_text = None
                 self.log_btn.configure(bg="#21262d", fg="#8b949e")
 
         def _on_enter(self, event):
@@ -833,6 +956,12 @@ def run_chat():
             self.chat_area.configure(state=tk.DISABLED)
             self.chat_area.see(tk.END)
 
+        def _do_restart(self):
+            """用户点击「立即重启」→ 替换文件并重启"""
+            if not self._pending_update:
+                return
+            do_restart(self._pending_update)
+
         def _poll_agent_status(self):
             if agent_status["connected"]:
                 self.agent_dot.configure(fg="#3fb950")
@@ -861,14 +990,17 @@ def run_chat():
                     self._device_map = new_map
                     self.target_device_combo["values"] = device_options
 
-            # 刷新日志面板（始终消费队列）
+            # 刷新日志（始终消费队列到缓冲区）
             while not agent_log_queue.empty():
                 try:
                     line = agent_log_queue.get_nowait()
-                    if self.show_logs:
+                    self.log_buffer.append((line, "log_err" if "ERR" in line or "Error" in line else "log_ok" if "Connected" in line else "log_info"))
+                    if len(self.log_buffer) > 200:
+                        self.log_buffer.pop(0)
+                    if self.log_text is not None:
                         self.log_text.configure(state=tk.NORMAL)
-                        tag = "log_err" if "ERR" in line or "Error" in line else "log_ok" if "Connected" in line else "log_info"
-                        self.log_text.insert(tk.END, line + "\n", tag)
+                        tag = self.log_buffer[-1][1]
+                        self.log_text.insert(tk.END, self.log_buffer[-1][0] + "\n", tag)
                         self.log_text.see(tk.END)
                         self.log_text.configure(state=tk.DISABLED)
                 except:
@@ -887,18 +1019,18 @@ def run_chat():
                     msg = update_queue.get_nowait()
                     status = msg.get("status")
                     if status == "downloading":
-                        self._add_system(f"📦 正在下载 v{msg['version']} ...")
+                        self._add_system(f"[UPDATE] Downloading v{msg['version']} ...")
                     elif status == "progress":
                         pct = msg.get("percent", 0)
                         total = msg.get("total", 0)
                         downloaded = msg.get("downloaded", 0)
                         if total:
-                            self._add_system(f"⬇ 下载进度: {pct}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)")
+                            self._add_system(f"[UPDATE] Progress: {pct}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)")
                     elif status == "ready":
                         self._pending_update = msg
                         self._show_update_prompt(msg["version"], msg)
                     elif status == "error":
-                        self._add_system(f"⚠ 更新失败: {msg.get('msg','')}")
+                        self._add_system(f"[WARN] Update failed: {msg.get('msg','')}")
                 except:
                     break
 

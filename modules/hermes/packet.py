@@ -43,7 +43,7 @@ class PacketType:
 
     # 握手
     CHALLENGE      = "challenge"       # Bridge → Agent
-    AUTH_RESPONSE ="auth_response"  # Agent → Bridge
+    AUTH_REPLY = "auth_response"       # Agent → Bridge (v5.0 标准)
     BLACKLISTED    = "blacklisted"     # Bridge → Agent
 
 
@@ -130,7 +130,7 @@ def make_auth_response(response_hex: str, hostname: str, device_id: str,
     """Agent 构建认证响应，包含能力列表"""
     return {
         "v": PROTOCOL_VERSION,
-        "type": PacketType.AUTH_RESPONSE,
+        "type": PacketType.AUTH_REPLY,
         "response": response_hex,
         "hostname": hostname,
         "device_id": device_id,

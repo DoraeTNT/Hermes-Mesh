@@ -15,12 +15,14 @@ POST /version              → 更新版本号（需认证）
 GET  /health               → 健康检查
 """
 
-import os, json, hashlib, re, time
+import os, json, hashlib, hmac, re, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from datetime import datetime
 
-import config
+from collections import defaultdict, deque
+
+from hermes import server_config as config
 # ── 速率限制 ──
 class RateLimiter:
     """简单滑动窗口速率限制器，每个 IP 独立计数"""
@@ -48,27 +50,20 @@ def _load_versions():
         "agent": {
             "version": config.AGENT_VERSION,
             "files": {
-                "exe": {"name": "HermesAgent.exe", "key": "download_url"},
-                "py":  {"name": "windows_agent_v4.py", "key": "python_url"},
-                "updater": {"name": "updater.py", "key": "updater_url"},
-                "main": {"name": "main_agent.py", "key": "main_url"},
+                "exe": {"name": "HermesLauncher.exe", "key": "download_url"},
+                "agent":  {"name": "modules/agent.py", "key": "python_url"},
+                "unified": {"name": "modules/unified.py", "key": "unified_url"},
+                "crypto": {"name": "modules/crypto_loader.py", "key": "crypto_url"},
+                "config": {"name": "modules/_enc_config.py", "key": "config_url"},
+                "streamer": {"name": "modules/streamer.py", "key": "streamer_url"},
+                "h_config": {"name": "modules/hermes/config.py", "key": "h_config_url"},
+                "h_updater": {"name": "modules/hermes/updater.py", "key": "h_updater_url"},
+                "h_agent": {"name": "modules/hermes/agent.py", "key": "h_agent_url"},
+                "h_chat": {"name": "modules/hermes/chat.py", "key": "h_chat_url"},
+                "h_main": {"name": "modules/hermes/main.py", "key": "h_main_url"},
+                "h_packet": {"name": "modules/hermes/packet.py", "key": "h_packet_url"},
             },
-            "changelog": "v4.0.4: 热更新端口改为3658",
-        },
-        "unified": {
-            "version": "3.0",
-            "files": {
-                "exe": {"name": "HermesUnified.exe", "key": "exe_url"},
-                "py":  {"name": "hermes_unified.py", "key": "py_url"},
-                "config": {"name": "hermes/config.py", "key": "config_url"},
-                "updater": {"name": "hermes/updater.py", "key": "updater_url"},
-                "agent": {"name": "hermes/agent.py", "key": "agent_url"},
-                "chat": {"name": "hermes/chat.py", "key": "chat_url"},
-                "main": {"name": "hermes/main.py", "key": "main_url"},
-                "init": {"name": "hermes/__init__.py", "key": "init_url"},
-                "modules": {"name": "modules.json", "key": "modules_url"},
-            },
-            "changelog": "v3.0: 模块化架构，launcher永不更新",
+            "changelog": "v4.2: stream module",
         },
         "chat": {
             "version": "2.2",
@@ -77,6 +72,16 @@ def _load_versions():
                 "py":  {"name": "chat_client.py", "key": "py_url"},
             },
             "changelog": "v2.2: 初始版本",
+        },
+        "unified": {
+            "version": "3.2",
+            "files": {
+                "exe": {"name": "HermesLauncher.exe", "key": "exe_url"},
+                "py":  {"name": "modules/unified.py", "key": "py_url"},
+                "agent": {"name": "modules/agent.py", "key": "agent_url"},
+                "crypto": {"name": "modules/crypto_loader.py", "key": "crypto_url"},
+            },
+            "changelog": "v3.2: status callback + emoji fix",
         },
     }
     if os.path.exists(config.VERSIONS_FILE):
@@ -152,6 +157,9 @@ class UpdateHandler(BaseHTTPRequestHandler):
     def _check_rate_limit(self):
         """检查请求频率，超过限制返回 429 Too Many Requests"""
         client_ip = self.client_address[0]
+        # 本地回环和私有地址绕过速率限制
+        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+            return True
         if not rate_limiter.is_allowed(client_ip):
             self.send_error(429, "Too Many Requests")
             return False
@@ -225,6 +233,14 @@ class UpdateHandler(BaseHTTPRequestHandler):
             fname = path[1:]
             if ".." in fname:
                 self._send_json({"error": "invalid filename"}, 400)
+                return
+            # modules.json 始终允许（热更新核心配置文件）
+            if fname == "modules/modules.json":
+                fpath = os.path.join(config.UPDATE_DIR, "modules.json")
+                if os.path.exists(fpath) and os.path.isfile(fpath):
+                    self._send_file(fpath, "modules.json")
+                else:
+                    self.send_error(404)
                 return
             # 白名单检查：只允许下载已知文件
             allowed = set()
