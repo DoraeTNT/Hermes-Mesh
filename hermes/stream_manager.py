@@ -11,7 +11,7 @@ logger = logging.getLogger("hermes.stream_mgr")
 _streams = {}
 _streams_lock = threading.Lock()
 
-TS_BUFFER_MIN = 32768   # buffer at least 32KB of TS before feeding FFmpeg
+TS_BUFFER_MIN = 4096   # buffer at least 4KB before feeding FFmpeg (TS needs full 188B packets)
 MAX_SEGMENTS = 120       # ~60s of fMP4 at 2 segments/s
 GOP_FRAMES = 20
 FRAG_DURATION = 500000  # 0.5s
@@ -83,17 +83,23 @@ class StreamSession:
                 self.active = False
 
     def feed_ts(self, data: bytes):
-        """Feed TS data directly to FFmpeg."""
+        """Accumulate TS, flush when buffer reaches threshold (FFmpeg needs full TS packets)."""
         if not self.active or self.ffmpeg_proc is None:
             return False
-        try:
-            self.ffmpeg_proc.stdin.write(data)
-            self.ffmpeg_proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            logger.warning("[STREAM_MGR] Pipe broken for %s", self.device_id)
-            self.stop()
-            return False
-        return True
+        self._ts_buf += data
+        if len(self._ts_buf) >= TS_BUFFER_MIN:
+            try:
+                self.ffmpeg_proc.stdin.write(self._ts_buf)
+                self.ffmpeg_proc.stdin.flush()
+                logger.info("[STREAM_MGR] Flushed %d bytes TS to FFmpeg for %s",
+                           len(self._ts_buf), self.device_id)
+            except (BrokenPipeError, OSError):
+                logger.warning("[STREAM_MGR] Pipe broken for %s", self.device_id)
+                self.stop()
+                return False
+            self._ts_buf = b""
+            return True
+        return False
 
     def flush_ts(self):
         """Force flush remaining TS buffer."""
