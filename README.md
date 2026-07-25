@@ -1,40 +1,69 @@
 # Hermes GUI Agent
 
-远程 Windows 桌面管理与 Agent 协作平台。通过 TCP Bridge + HTTP API 实现对多台 Windows 主机的远程控制、实时视频流、文件传输、LLM 对话等功能。
+AI 驱动的 Windows 自动化运维平台。通过云端技能分发 + Windows Agent 后台执行，实现鼠标键盘操控、文件检索、病毒查杀、系统修复等自动化能力。AI 作为决策引擎，通过自然语言对话即可完成复杂运维任务。
+
+## 核心能力
+
+```
+你说"帮我检查这台电脑有没有病毒" 
+    → Chat Server (DeepSeek 理解意图)
+    → Bridge 下发技能指令
+    → Windows Agent 后台执行（进程扫描、文件检索、注册表检查）
+    → 结果回传，AI 分析并给出建议
+```
+
+### Windows Agent 能做什么
+
+| 能力 | 实现方式 | 用途 |
+|------|----------|------|
+| 🖱️ 鼠标键盘操控 | ctypes 直接发送输入事件 | 操作任意桌面应用 |
+| 📸 截图分析 | mss 快速截图 + vision 模型识别 | 定位 UI 元素、验证操作结果 |
+| 🔍 后台文件检索 | cmd 命令执行 | 全盘搜索、文件内容检查 |
+| 🛡️ 病毒查杀 | 多引擎扫描（进程/签名/网络/持久化 7 层 41+ 检查项） | 安全运维 |
+| 🔧 系统修复 | 自动诊断 + 修复 | Windows 常见问题一键修复 |
+| 📋 剪贴板读写 | Win32 clipboard API | 数据传输 |
+
+### 技能分发体系
+
+Hermes 云端维护了一套技能库，通过 Bridge 下发给 Windows Agent：
+
+- **windows-malware-scan** — 恶意软件全面扫描（7 层 41+ 检查项）
+- **windows-repair** — 系统诊断与自动修复
+- **windows-mouse-precision** — 视觉定位 + 反馈闭环的精准鼠标操作
+- **windows-cmd-reference** — 120+ 常用 Windows 命令速查
+
+Agent 收到技能指令后本地执行，结果回传 AI 分析，全程无需人工远程桌面。
 
 ## 架构
 
 ```
-┌──────────────────────────────────────────────────┐
-│  Linux 服务端                                       │
-│                                                    │
-│  ┌─────────┐  ┌──────────┐  ┌───────────┐        │
-│  │ Bridge  │  │ Chat     │  │ Dashboard │        │
-│  │ :25917  │  │ :8891    │  │ :8892     │        │
-│  │ :9123   │  └──────────┘  └───────────┘        │
-│  └────┬────┘  ┌──────────┐  ┌───────────┐        │
-│       │       │ Update   │  │ Threat    │        │
-│       │       │ :8890    │  │ :8893     │        │
-│       │       └──────────┘  └───────────┘        │
-│       │                                            │
-│  ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─     │
-│  Nginx│(:80/:443)                                  │
-└───────┼────────────────────────────────────────────┘
-        │  TCP (v5 protocol, HMAC auth)
+┌─────────────────────────────────────────────────┐
+│  Linux 服务端 (阿里云 ECS)                         │
+│                                                   │
+│  ┌─────────┐  ┌──────────┐  ┌───────────┐       │
+│  │ Bridge  │  │ Chat     │  │ Dashboard │       │
+│  │ v5.0    │  │ DeepSeek │  │ 监控看板   │       │
+│  └────┬────┘  └──────────┘  └───────────┘       │
+│       │       ┌──────────┐  ┌───────────┐       │
+│       │       │ Update   │  │ Threat    │       │
+│       │       │ OTA 更新  │  │ 情报引擎   │       │
+│       │       └──────────┘  └───────────┘       │
+│       │                                           │
+│  ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─    │
+│  Nginx (反代对外暴露)                               │
+└───────┼───────────────────────────────────────────┘
+        │  TCP 长连接 (v5 协议, HMAC 认证)
         │
-┌───────┴────────────────────────────────────────────┐
-│  Windows Agent (PyInstaller .exe)                   │
-│                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────┐   │
-│  │ Launcher │  │ Unified  │  │ Streamer       │   │
-│  │ (bootstrap)│ │ (GUI+tray)│ │ (FFmpeg H.264) │   │
-│  └──────────┘  └──────────┘  └────────────────┘   │
-│                                                     │
-│  - 远程命令执行 + 截图                                │
-│  - 实时视频流 (H.264 fMP4 / MJPEG)                   │
-│  - LLM 对话集成                                      │
-│  - 热更新 (Swap modules/*.py)                        │
-└─────────────────────────────────────────────────────┘
+┌───────┴───────────────────────────────────────────┐
+│  Windows Agent (后台运行, PyInstaller 打包 .exe)     │
+│                                                    │
+│  ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │
+│  │ Launcher │ │ Agent    │ │ Skill Executor   │  │
+│  │ 启 动器  │ │ 协议通信  │ │ 技能执行引擎      │  │
+│  └──────────┘ └──────────┘ └──────────────────┘  │
+│                                                    │
+│  后台执行: 鼠标键盘操控 / 截图 / 命令 / 文件检索      │
+└────────────────────────────────────────────────────┘
 ```
 
 ## 项目结构
@@ -42,129 +71,54 @@
 ```
 hermes_gui_agent/
 ├── server/               # 服务端（Linux）
-│   ├── bridge.py         # TCP Bridge v5.0 + HTTP API (:25917/:9123)
-│   ├── chat_server.py    # LLM 对话 API (:8891)
-│   ├── dashboard.py      # Web 监控看板 (:8892)
-│   ├── update_server.py  # 客户端 OTA 更新 (:8890)
-│   ├── threat_engine.py  # 威胁情报引擎 (:8893)
-│   └── video.html        # 实时视频查看页面
-├── client/               # Windows 客户端源码
-│   ├── launcher.py       # 薄启动器 (→ exe)
-│   ├── unified.py        # GUI 界面 + 托盘
-│   ├── agent.py          # TCP 连接 + 协议处理
-│   ├── streamer.py       # 屏幕采集 + FFmpeg 编码
-│   ├── runtime.py        # 运行时环境
+│   ├── bridge.py         # TCP Bridge v5.0 + HTTP API
+│   ├── chat_server.py    # LLM 对话 + Bridge 调用
+│   ├── dashboard.py      # Agent 状态监控
+│   ├── update_server.py  # 客户端 OTA 更新
+│   └── threat_engine.py  # 威胁情报引擎
+├── client/               # Windows Agent 源码 (→ PyInstaller .exe)
+│   ├── agent.py          # TCP 连接 + 技能执行
+│   ├── unified.py        # GUI 托盘界面
 │   ├── crypto_loader.py  # 加密配置解密
-│   └── build.bat         # PyInstaller 构建脚本
-├── modules/              # 客户端热更新模块副本
-│   ├── unified.py
-│   ├── agent.py
-│   ├── streamer.py
-│   ├── runtime.py
-│   ├── launcher.py
-│   └── crypto_loader.py
+│   └── build.bat         # 构建脚本
 ├── hermes/               # 共享库
-│   ├── config.py         # 统一日志配置
-│   ├── server_config.py  # 密钥/端口/路径配置（唯一真源）
+│   ├── server_config.py  # 统一配置（密钥/端口/路径）
 │   ├── packet.py         # v5 协议定义
-│   ├── stream_manager.py # 视频流管理（FFmpeg→fMP4→WebSocket）
-│   ├── updater.py        # OTA 更新逻辑
-│   ├── agent.py          # Agent 连接模型
-│   ├── chat.py           # LLM 对话处理
-│   ├── core/             # 核心模块
-│   │   ├── bridge.py     # Bridge 内部逻辑
-│   │   ├── security.py   # 安全/认证
-│   │   └── packet.py     # 协议数据包
-│   ├── api/              # API 路由
+│   ├── stream_manager.py # 视频流管理
 │   └── services/         # 后台服务
 ├── scripts/              # systemd 服务定义
-├── tests/                # 测试
-├── docs/                 # 文档
-├── requirements.txt      # Python 依赖
-└── versions.json         # 客户端版本元数据
+└── requirements.txt
 ```
 
 ## 服务端口
 
-| 服务 | 端口 | 协议 | 用途 |
-|------|------|------|------|
-| Bridge TCP | 25917 | TCP (v5) | Agent 长连接 |
-| Bridge HTTP | 9123 | HTTP | 内部 API |
-| Update Server | 8890 | HTTP | 客户端下载更新 |
-| Chat Server | 8891 | HTTP | LLM 对话 API |
-| Dashboard | 8892 | HTTP | 监控看板 |
-| Threat Engine | 8893 | HTTP | 威胁情报 |
-
-## 核心功能
-
-### 远程控制（Bridge API）
-- Windows Agent 通过 TCP 长连接注册到 Bridge，v5 协议（HMAC 认证 + ACK 两阶段确认）
-- 通过 Bridge HTTP API 可下发命令、触发截图、文件传输、屏幕采集
-- 实际调用方为 Chat Server 或其他集成系统，Dashboard 只展示状态
-
-### Dashboard（监控看板）
-- 仪表盘式 Web 界面，实时展示各服务状态与系统资源
-- 在线 Agent 列表（设备名、运行时长、能力）
-- 视频流入口、Flow 工作流导航
-
-### Chat Server（对话服务）
-- 对接 DeepSeek API，Agent 端可与 LLM 对话
-- 支持调用 Bridge API，将 AI 决策转化为远程操作
-
-### 实时视频流
-- FFmpeg 采集 Windows 桌面（🚧 开发中，尚未实现）
-- H.264 编码 → fMP4 分段 → MediaSource API 浏览器播放
-- 自动清理断开设备的 FFmpeg 进程（防内存泄漏）
-
-### 热更新
-- 客户端启动时检查 `versions.json`
-- 自动下载新版本模块文件 (`modules/*.py`)
-- 无需重新打包 exe，替换 `.py` 即可生效
-
-### 安全
-- 加密配置：`_enc_config.py`（XOR + base64），客户端零明文 IP
-- 所有密钥通过环境变量注入，无硬编码
-- 速率限制（60 req / 60s 窗口，本地 IP 白名单绕过）
+| 服务 | 端口 | 用途 |
+|------|------|------|
+| Bridge TCP | 25917 | Agent 长连接 |
+| Bridge HTTP | 9123 | 内部 API |
+| Chat Server | 8891 | LLM 对话 |
+| Dashboard | 8892 | 监控看板 |
+| Update Server | 8890 | OTA 更新 |
+| Threat Engine | 8893 | 威胁情报 |
 
 ## 部署
 
-### 服务端
 ```bash
-# 安装依赖
+# 服务端
 pip install -r requirements.txt
-
-# 配置密钥（环境变量或 ~/.hermes/.env）
-export SHARED_SECRET=your_shared_secret
-export CHAT_API_KEY=your_chat_key
-export DASHBOARD_API_KEY=your_dashboard_key
-export THREAT_API_KEY=your_threat_key
-export UPDATE_API_KEY=your_update_key
-export REQUIRE_CUSTOM_KEYS=0   # 开发环境跳过强制密钥检查
-
-# 安装 systemd 服务
 sudo cp scripts/hermes-*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now hermes-bridge hermes-chat hermes-dashboard hermes-update-server hermes-threat
-```
+sudo systemctl enable --now hermes-bridge hermes-chat hermes-dashboard
 
-### Windows 客户端
-```batch
-cd client
-build.bat
-:: 产物在 dist/HermesLauncher.exe + dist/modules/
+# Windows 客户端
+cd client && build.bat
+# → dist/HermesLauncher.exe
 ```
 
 ## 关于本项目
 
 > 本项目由 **AI 自主构建**，经测试可正常使用。如有问题或更好的想法，欢迎通过 [GitHub Issues](../../issues) 留言反馈。
 
-## 版本
-
-**Agent v4.1** — 当前版本，定义于 `hermes/server_config.py`。
-
 ## 依赖
 
-- Python 3.11+
-- FFmpeg（服务端视频流转码、客户端屏幕采集）
-- DeepSeek API（聊天功能）
-- 阿里云 ECS（当前生产环境）
+- Python 3.11+ | FFmpeg | DeepSeek API
+- 阿里云 ECS（服务端）| Windows 10/11（Agent 端）
