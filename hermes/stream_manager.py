@@ -83,9 +83,19 @@ class StreamSession:
                 self.active = False
 
     def feed_ts(self, data: bytes):
-        """Accumulate TS, flush when buffer reaches threshold (FFmpeg needs full TS packets)."""
+        """Accumulate TS, flush when buffer reaches threshold. First chunk always fed immediately."""
         if not self.active or self.ffmpeg_proc is None:
             return False
+        if not self._ts_buf and len(data) >= 4096:
+            # First large chunk — feed immediately so FFmpeg gets PAT/PMT right away
+            try:
+                self.ffmpeg_proc.stdin.write(data)
+                self.ffmpeg_proc.stdin.flush()
+                return True
+            except (BrokenPipeError, OSError):
+                logger.warning("[STREAM_MGR] Pipe broken for %s", self.device_id)
+                self.stop()
+                return False
         self._ts_buf += data
         if len(self._ts_buf) >= TS_BUFFER_MIN:
             try:
