@@ -97,10 +97,19 @@ hermes_gui_agent/
 
 ## 核心功能
 
-### 远程控制
-- Windows Agent 通过 TCP 长连接注册到 Bridge
-- 支持命令执行、截图、文件传输、屏幕采集
-- v5 协议：HMAC 认证、ACK 两阶段确认
+### 远程控制（Bridge API）
+- Windows Agent 通过 TCP 长连接注册到 Bridge，v5 协议（HMAC 认证 + ACK 两阶段确认）
+- 通过 Bridge HTTP API 可下发命令、触发截图、文件传输、屏幕采集
+- 实际调用方为 Chat Server 或其他集成系统，Dashboard 只展示状态
+
+### Dashboard（监控看板）
+- 仪表盘式 Web 界面，实时展示各服务状态与系统资源
+- 在线 Agent 列表（设备名、运行时长、能力）
+- 视频流入口、Flow 工作流导航
+
+### Chat Server（对话服务）
+- 对接 DeepSeek API，Agent 端可与 LLM 对话
+- 支持调用 Bridge API，将 AI 决策转化为远程操作
 
 ### 实时视频流
 - FFmpeg 采集 Windows 桌面 (gdigrab)
