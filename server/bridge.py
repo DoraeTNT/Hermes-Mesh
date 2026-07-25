@@ -241,27 +241,23 @@ class TCPServer:
                 if msg.get("type") == "stream":
                     try:
                         import base64 as _b64
-                        from hermes.stream_manager import feed_stream, feed_init
+                        from hermes.stream_manager import feed_stream
                         global _ts_bytes_total, _ts_pkt_total, _ts_last_report
-                        raw_data = _b64.b64decode(msg.get("data", ""))
-                        subtype = msg.get("subtype", "segment")  # "init" or "segment"
+                        ts_data = _b64.b64decode(msg.get("data", ""))
                         did = conn.device_id
                         # 计数器（诊断）
-                        _ts_bytes_total += len(raw_data)
+                        _ts_bytes_total += len(ts_data)
                         _ts_pkt_total += 1
                         now = time.time()
                         if now - _ts_last_report >= 2.0:
                             rate = _ts_bytes_total / (now - _ts_last_report) / 1024
-                            logger.info("[BRIDGE] fMP4 in: %d pkt/s  %.1f KB/s  total=%d",
+                            logger.info("[BRIDGE] TS in: %d pkt/s  %.1f KB/s  total=%d",
                                        _ts_pkt_total, rate, _ts_pkt_total)
                             _ts_bytes_total = 0
                             _ts_pkt_total = 0
                             _ts_last_report = now
-                        # 线程池执行，避免阻塞事件循环
-                        if subtype == "init":
-                            _stream_executor.submit(feed_init, did, raw_data)
-                        else:
-                            _stream_executor.submit(feed_stream, did, raw_data)
+                        # 线程池执行
+                        _stream_executor.submit(feed_stream, did, ts_data)
                     except Exception as e:
                         logger.warning("STREAM error: %s", e)
                     continue
@@ -481,25 +477,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 "protocol": pkt.PROTOCOL_VERSION,
             })
         elif path_base == "/stream-meta":
-            # fMP4 init segment + codec info
-            import base64
+            # Stream status
             device_id = params.get("device_id", "")
             if not device_id:
                 self._json({"error": "device_id required"}, 400)
                 return
-            from hermes.stream_manager import get_or_create_stream
-            session = get_or_create_stream(device_id)
-            init = session.get_init()
-            if not init:
-                self._json({"error": "stream not ready (no init segment)"}, 503)
-                return
-            self._json({
-                "codec": session.codec,
-                "init_b64": base64.b64encode(init).decode(),
-                "active": session.active,
-            })
+            from hermes.stream_manager import get_stream_status
+            self._json(get_stream_status(device_id))
         elif path_base == "/stream-sse":
-            # SSE 视频流
+            # SSE — raw TS chunks (base64), browser demuxes with mux.js
             import base64
             device_id = params.get("device_id", "")
             if not device_id:
@@ -516,19 +502,16 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             session.client_count += 1
-            last_id = 0
+            last_seq = 0
             try:
-                while session.active or len(session.segments) > 0:
-                    segments = session.get_segments_since(last_id)
-                    for sid, data in segments:
+                while session.active or len(session.chunks) > 0:
+                    chunks = session.get_chunks_since(last_seq)
+                    for seq, data in chunks:
                         b64 = base64.b64encode(data).decode()
-                        try:
-                            self.wfile.write(f"data: {b64}\n\n".encode())
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError):
-                            raise
-                        last_id = max(last_id, sid)
-                    if not segments:
+                        self.wfile.write(f"id: {seq}\ndata: {b64}\n\n".encode())
+                        self.wfile.flush()
+                        last_seq = max(last_seq, seq)
+                    if not chunks:
                         time.sleep(0.05)
             except (BrokenPipeError, ConnectionResetError):
                 pass
