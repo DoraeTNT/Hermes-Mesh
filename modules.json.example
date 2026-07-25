@@ -4,22 +4,22 @@
     "crypto_loader": {
       "version": "1.0",
       "path": "modules/crypto_loader.py",
-      "url": "http://127.0.0.1:80/modules/crypto_loader.py"
+      "url": "http://YOUR_SERVER/modules/crypto_loader.py"
     },
     "unified": {
       "version": "3.21",
       "path": "modules/unified.py",
-      "url": "http://127.0.0.1:80/modules/unified.py"
+      "url": "http://YOUR_SERVER/modules/unified.py"
     },
     "agent": {
       "version": "4.2",
       "path": "modules/agent.py",
-      "url": "http://127.0.0.1:80/modules/agent.py"
+      "url": "http://YOUR_SERVER/modules/agent.py"
     },
     "streamer": {
       "version": "1.9",
       "path": "modules/streamer.py",
-      "url": "http://127.0.0.1:80/modules/streamer.py"
+      "url": "http://YOUR_SERVER/modules/streamer.py"
     }
   }
 }
