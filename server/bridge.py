@@ -241,23 +241,27 @@ class TCPServer:
                 if msg.get("type") == "stream":
                     try:
                         import base64 as _b64
-                        from hermes.stream_manager import feed_stream
+                        from hermes.stream_manager import feed_stream, feed_init
                         global _ts_bytes_total, _ts_pkt_total, _ts_last_report
-                        ts_data = _b64.b64decode(msg.get("data", ""))
+                        raw_data = _b64.b64decode(msg.get("data", ""))
+                        subtype = msg.get("subtype", "segment")  # "init" or "segment"
                         did = conn.device_id
                         # 计数器（诊断）
-                        _ts_bytes_total += len(ts_data)
+                        _ts_bytes_total += len(raw_data)
                         _ts_pkt_total += 1
                         now = time.time()
-                        if now - _ts_last_report >= 1.0:
+                        if now - _ts_last_report >= 2.0:
                             rate = _ts_bytes_total / (now - _ts_last_report) / 1024
-                            logger.info("[BRIDGE] TS in: %d pkt/s  %.1f KB/s  total_pkt=%d",
+                            logger.info("[BRIDGE] fMP4 in: %d pkt/s  %.1f KB/s  total=%d",
                                        _ts_pkt_total, rate, _ts_pkt_total)
                             _ts_bytes_total = 0
                             _ts_pkt_total = 0
                             _ts_last_report = now
-                        # 线程池执行，避免 FFmpeg 管道阻塞事件循环
-                        _stream_executor.submit(feed_stream, did, ts_data)
+                        # 线程池执行，避免阻塞事件循环
+                        if subtype == "init":
+                            _stream_executor.submit(feed_init, did, raw_data)
+                        else:
+                            _stream_executor.submit(feed_stream, did, raw_data)
                     except Exception as e:
                         logger.warning("STREAM error: %s", e)
                     continue
