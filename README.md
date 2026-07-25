@@ -146,6 +146,10 @@ build.bat
 :: 产物在 dist/HermesLauncher.exe + dist/modules/
 ```
 
+## 关于本项目
+
+> 本项目由 **AI 自主构建**，经测试可正常使用。如有问题或更好的想法，欢迎通过 [GitHub Issues](../../issues) 留言反馈。
+
 ## 版本
 
 **Agent v4.1** — 当前版本，定义于 `hermes/server_config.py`。
