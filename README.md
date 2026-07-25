@@ -110,5 +110,15 @@ cd client && build.bat
 
 ## 依赖
 
-- Python 3.11+ | FFmpeg | DeepSeek API
-- 阿里云 ECS（服务端）| Windows 10/11（Agent 端）
+**服务端（Linux）**
+- Python 3.11+
+- FFmpeg
+
+**Windows 客户端**
+- Python 3.11+（含 tkinter，Windows 版 Python 自带）
+- FFmpeg
+- PyInstaller（打包 .exe）
+
+**Python 包**（`pip install -r requirements.txt`）
+- Pillow — 截图与图像处理
+- PyInstaller — 客户端打包为 .exe
