@@ -114,8 +114,8 @@ async function startStream() {
     return;
   }
 
-  // Play fMP4 via <video> tag — works on all browsers
-  var streamUrl = "/stream-fmp4?device_id=" + currentDevice + "&_=" + Date.now();
+  // Play raw TS via <video> tag
+  var streamUrl = "/stream-ts?device_id=" + currentDevice + "&_=" + Date.now();
   video.src = streamUrl;
   video.style.display = "block";
   video.play().catch(function(e) { log("play error: " + e); });

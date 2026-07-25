@@ -601,6 +601,39 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
             finally:
                 session.client_count = max(0, session.client_count - 1)
+        elif path_base == "/stream-ts":
+            # Raw TS relay — <video> tag plays on some browsers natively
+            device_id = params.get("device_id", "")
+            if not device_id:
+                self._json({"error": "device_id required"}, 400)
+                return
+            from hermes.stream_manager import get_or_create_stream
+            session = get_or_create_stream(device_id)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            session.client_count += 1
+            last_seq = 0
+            try:
+                while session.active or len(session._chunks) > 0:
+                    chunks = session.get_chunks_since(last_seq)
+                    for seq, data in chunks:
+                        try:
+                            self.wfile.write(data)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            raise
+                        last_seq = max(last_seq, seq)
+                    if not chunks:
+                        time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                session.client_count = max(0, session.client_count - 1)
         else:
             self._json({"error": "not found"}, 404)
 
