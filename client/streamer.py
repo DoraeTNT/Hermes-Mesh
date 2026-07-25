@@ -240,9 +240,9 @@ def _stream_loop():
 
             fps_counter += 1
             now = time.time()
-            if now - fps_timer >= 5.0:
+            if now - fps_timer >= 1.0:
                 actual_fps = fps_counter / (now - fps_timer)
-                _dbg(f"FPS: {actual_fps:.1f} send_ok={fps_counter}")
+                _dbg(f"[TS pkt/s] {actual_fps:.0f}  in={len(ts_chunk)}B  total={fps_counter}")
                 fps_counter = 0
                 fps_timer = now
 

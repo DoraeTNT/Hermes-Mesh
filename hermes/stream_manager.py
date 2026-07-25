@@ -11,7 +11,8 @@ _streams = {}
 _streams_lock = threading.Lock()
 
 MAX_BUFFER_SEGMENTS = 60
-SEGMENT_DURATION = 1.0
+SEGMENT_DURATION = 0.5   # 0.5s max fragment duration for smooth segment delivery
+GOP_FRAMES = 20           # keyframe every 20 frames (~1s at 20fps)
 
 
 class StreamSession:
@@ -49,13 +50,13 @@ class StreamSession:
                 "-pix_fmt", "yuv420p",
                 "-profile:v", "main",
                 "-level", "4.0",
-                "-g", "48",                        # GOP = 48 frames (~2.4s at 20fps)
-                "-keyint_min", "48",
-                "-sc_threshold", "0",              # force keyframe at GOP boundary
+                "-g", str(GOP_FRAMES),              # GOP = 20 frames (~1s at 20fps)
+                "-keyint_min", str(GOP_FRAMES),
+                "-sc_threshold", "0",               # force keyframe at GOP boundary
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
                 "-crf", "23",
-                "-an",                             # no audio (gdigrab has no audio)
+                "-an",                              # no audio (gdigrab has no audio)
                 "-f", "mp4",
                 "-movflags", "frag_keyframe+default_base_moof+omit_tfhd_offset",
                 "-frag_duration", str(int(SEGMENT_DURATION * 1_000_000)),
@@ -75,7 +76,8 @@ class StreamSession:
                 )
                 self.active = True
                 self._ffmpeg_ready.set()
-                logger.info("[STREAM_MGR] FFmpeg started (libx264 main L4.0) for %s", self.device_id)
+                logger.info("[STREAM_MGR] FFmpeg started (libx264 main L4.0, gop=%d, frag=%.1fs) for %s",
+                           GOP_FRAMES, SEGMENT_DURATION, self.device_id)
 
                 t = threading.Thread(target=self._read_ffmpeg_output, daemon=True,
                                      name=f"ffmpeg-out-{self.device_id[:8]}")
@@ -123,6 +125,7 @@ class StreamSession:
                 segments_this_round = 0
                 while len(buf) >= 8 and segments_this_round < 20:
                     if not init_done:
+                        # Find moov box: scan for "moov" at position 4 (after 4-byte size)
                         moov_pos = buf.find(b"moov")
                         if moov_pos < 4:
                             break
@@ -139,6 +142,7 @@ class StreamSession:
                         buf = buf[moov_end:]
                         continue
 
+                    # Scan for moof box: 4-byte size + "moof"
                     if buf[4:8] != b"moof":
                         buf = buf[1:]
                         continue
@@ -148,9 +152,14 @@ class StreamSession:
                         buf = buf[1:]
                         continue
 
+                    # Validate: next box should be "mdat" (not random data that happens to have "moof")
                     mdat_off = moof_size
                     if mdat_off + 8 > len(buf):
                         break
+
+                    if buf[mdat_off+4:mdat_off+8] != b"mdat":
+                        buf = buf[1:]  # false positive
+                        continue
 
                     mdat_size = struct.unpack('>I', buf[mdat_off:mdat_off+4])[0]
                     if mdat_size < 8 or mdat_size > 500000:
@@ -237,3 +246,165 @@ def list_active_streams() -> list:
             {"device_id": did, "active": s.active, "clients": s.client_count}
             for did, s in _streams.items()
         ]
+
+
+# ══════════════════════════════════════════════════
+#  MJPEG Pipeline — FFmpeg TS → MJPEG frames via SSE
+#  Simple, reliable, no codec compatibility issues
+# ══════════════════════════════════════════════════
+
+_mjpeg_streams = {}
+_mjpeg_lock = threading.Lock()
+MJPEG_MAX_FRAMES = 10  # keep last 10 frames
+
+class MjpegSession:
+    def __init__(self, device_id):
+        self.device_id = device_id
+        self.active = False
+        self.ffmpeg_proc = None
+        self.frames = []         # [(frame_id, jpeg_bytes), ...]
+        self.frames_lock = threading.Lock()
+        self.client_count = 0
+        self._frame_id = 0
+        self._start_lock = threading.Lock()
+
+    def start_ffmpeg(self):
+        if self.ffmpeg_proc is not None:
+            return
+        with self._start_lock:
+            if self.ffmpeg_proc is not None:
+                return
+            cmd = [
+                "ffmpeg",
+                "-fflags", "+genpts",
+                "-f", "mpegts",
+                "-i", "pipe:0",
+                "-c:v", "mjpeg",
+                "-q:v", "12",
+                "-an",
+                "-f", "image2pipe",
+                "-avioflags", "direct",
+                "-fflags", "nobuffer",
+                "pipe:1",
+            ]
+            try:
+                self.ffmpeg_proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.active = True
+                logger.info("[STREAM_MGR] MJPEG FFmpeg started for %s", self.device_id)
+                t = threading.Thread(target=self._read_frames, daemon=True,
+                                     name=f"mjpeg-out-{self.device_id[:8]}")
+                t.start()
+            except Exception as e:
+                logger.error("[STREAM_MGR] MJPEG FFmpeg start failed: %s", e)
+                self.active = False
+
+    def stop_ffmpeg(self):
+        self.active = False
+        if self.ffmpeg_proc:
+            try:
+                self.ffmpeg_proc.stdin.close()
+                self.ffmpeg_proc.terminate()
+                self.ffmpeg_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.ffmpeg_proc.kill()
+                except Exception:
+                    pass
+            self.ffmpeg_proc = None
+        logger.info("[STREAM_MGR] MJPEG FFmpeg stopped for %s", self.device_id)
+
+    def feed_ts(self, ts_data: bytes):
+        if not self.active or self.ffmpeg_proc is None:
+            return
+        try:
+            self.ffmpeg_proc.stdin.write(ts_data)
+            self.ffmpeg_proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            logger.warning("[STREAM_MGR] MJPEG pipe broken for %s", self.device_id)
+            self.stop_ffmpeg()
+
+    def _read_frames(self):
+        buf = b""
+        fps_cnt = 0
+        fps_last = time.time()
+        try:
+            while self.active and self.ffmpeg_proc:
+                chunk = self.ffmpeg_proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                # Extract JPEG frames: start FF D8, end FF D9
+                while True:
+                    soi = buf.find(b'\xff\xd8')
+                    if soi < 0:
+                        break
+                    if soi > 0:
+                        buf = buf[soi:]
+                    eoi = buf.find(b'\xff\xd9')
+                    if eoi < 2:
+                        break
+                    frame_data = bytes(buf[:eoi+2])
+                    buf = buf[eoi+2:]
+                    if len(frame_data) < 100:
+                        continue  # skip tiny/corrupt frames
+                    self._add_frame(frame_data)
+                    fps_cnt += 1
+                    now = time.time()
+                    if now - fps_last >= 1.0:
+                        logger.info("[STREAM_MGR] MJPEG FPS=%d frames=%d", fps_cnt, self._frame_id)
+                        fps_cnt = 0
+                        fps_last = now
+        except Exception as e:
+            logger.error("[STREAM_MGR] MJPEG read error: %s", e)
+        finally:
+            logger.info("[STREAM_MGR] MJPEG reader stopped for %s", self.device_id)
+
+    def _add_frame(self, data: bytes):
+        with self.frames_lock:
+            self._frame_id += 1
+            self.frames.append((self._frame_id, data))
+            while len(self.frames) > MJPEG_MAX_FRAMES:
+                self.frames.pop(0)
+
+    def get_latest_frame(self):
+        with self.frames_lock:
+            if self.frames:
+                return self.frames[-1]
+            return None
+
+    def get_frames_since(self, since_id=0):
+        with self.frames_lock:
+            return [(fid, data) for fid, data in self.frames if fid > since_id]
+
+
+def get_or_create_mjpeg(device_id: str) -> MjpegSession:
+    with _mjpeg_lock:
+        if device_id not in _mjpeg_streams:
+            _mjpeg_streams[device_id] = MjpegSession(device_id)
+        return _mjpeg_streams[device_id]
+
+
+def start_mjpeg(device_id: str) -> MjpegSession:
+    session = get_or_create_mjpeg(device_id)
+    if not session.active:
+        session.start_ffmpeg()
+    return session
+
+
+def stop_mjpeg(device_id: str):
+    with _mjpeg_lock:
+        session = _mjpeg_streams.pop(device_id, None)
+    if session:
+        session.stop_ffmpeg()
+
+
+def feed_mjpeg(device_id: str, ts_data: bytes):
+    session = get_or_create_mjpeg(device_id)
+    if not session.active:
+        session.start_ffmpeg()
+    session.feed_ts(ts_data)

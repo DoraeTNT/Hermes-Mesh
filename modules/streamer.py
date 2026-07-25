@@ -154,6 +154,7 @@ def _build_ffmpeg_cmd(encoder, encoder_opts):
     """构建 FFmpeg 命令行"""
     global _stream_fps, _stream_width, _stream_height
 
+    # 基础参数
     cmd = [
         "-f", "gdigrab",              # Windows 桌面采集
         "-framerate", str(_stream_fps),
@@ -167,11 +168,13 @@ def _build_ffmpeg_cmd(encoder, encoder_opts):
         "-mpegts_flags", "system_b",
     ]
 
+    # 如果知道分辨率，限制采集区域
     if _stream_width > 0 and _stream_height > 0:
+        # 插入 video filter 来设置分辨率
         cmd.insert(cmd.index("-c:v"), "-vf")
         cmd.insert(cmd.index("-c:v"), f"scale={_stream_width}:{_stream_height}")
 
-    cmd.append("pipe:1")
+    cmd.append("pipe:1")  # 输出到 stdout
     return cmd
 
 
@@ -237,9 +240,9 @@ def _stream_loop():
 
             fps_counter += 1
             now = time.time()
-            if now - fps_timer >= 5.0:
+            if now - fps_timer >= 1.0:
                 actual_fps = fps_counter / (now - fps_timer)
-                _dbg(f"FPS: {actual_fps:.1f} send_ok={fps_counter}")
+                _dbg(f"[TS pkt/s] {actual_fps:.0f}  in={len(ts_chunk)}B  total={fps_counter}")
                 fps_counter = 0
                 fps_timer = now
 

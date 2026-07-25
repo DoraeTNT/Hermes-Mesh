@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Stream - Hermes GUI Agent</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+.header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.header h1{font-size:18px;color:#58a6ff}
+.header a{color:#8b949e;text-decoration:none;font-size:13px}
+.header a:hover{color:#c9d1d9}
+.controls{padding:10px 20px;display:flex;gap:10px;align-items:center;flex-shrink:0;background:#161b22;border-bottom:1px solid #30363d}
+.controls select,.controls button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 12px;font-size:13px;font-family:inherit;cursor:pointer}
+.controls button.primary{background:#238636;border-color:#238636;color:#fff}
+.controls button.danger{background:#da3633;border-color:#da3633;color:#fff}
+.controls button:disabled{opacity:0.4;cursor:not-allowed}
+.status{font-size:12px;padding:4px 12px;border-radius:10px;background:#21262d}
+.status.live{color:#3fb950}
+.status.waiting{color:#f0883e}
+.status.error{color:#f85149}
+#videoContainer{flex:1;display:flex;align-items:center;justify-content:center;position:relative;background:#000;min-height:0;overflow:hidden}
+#streamImg{max-width:100%;max-height:100%;object-fit:contain}
+#placeholder{color:#484f58;font-size:14px;text-align:center}
+.info-bar{padding:8px 20px;font-size:11px;color:#484f58;background:#161b22;border-top:1px solid #30363d;flex-shrink:0;display:flex;gap:16px}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Video Stream</h1>
+  <a href=".">Dashboard</a>
+</div>
+<div class="controls">
+  <select id="deviceSelect"><option value="">-- Select Device --</option></select>
+  <button id="startBtn" class="primary" onclick="startStream()" disabled>Start Stream</button>
+  <button id="stopBtn" class="danger" onclick="stopStream()" disabled>Stop</button>
+  <span id="status" class="status waiting">Not Connected</span>
+</div>
+<div id="videoContainer">
+  <img id="streamImg" alt="stream" style="display:none">
+  <div id="placeholder">Select a device and click Start Stream</div>
+</div>
+<div class="info-bar">
+  <span id="fps">FPS: --</span>
+  <span id="resolution">Resolution: --</span>
+  <span id="frames">Frames: 0</span>
+</div>
+
+<script>
+var DK = "";
+var API_KEY = new URLSearchParams(window.location.search).get("api_key") || DK;
+var API = window.location.pathname.replace(/\/video$/, "").replace(/\/$/, "") + "/api";
+
+var img = document.getElementById("streamImg");
+var streamActive = false;
+var currentDevice = "";
+var frameCount = 0;
+var fpsTimer = 0;
+
+function log(msg) { console.log("[VIDEO] " + msg); }
+
+async function loadDevices() {
+  try {
+    var r = await fetch(API + "/devices?api_key=" + API_KEY, {headers: {"X-Api-Key": API_KEY}});
+    var data = await r.json();
+    var sel = document.getElementById("deviceSelect");
+    var cur = sel.value;
+    sel.innerHTML = "<option value=\"\">-- Select Device --</option>";
+    if (data.devices) {
+      Object.entries(data.devices).forEach(function(e) {
+        var id = e[0], info = e[1];
+        sel.innerHTML += "<option value=\""+id+"\""+(id===cur?" selected":"")+">"+(info.name||id)+" ("+id.slice(0,8)+"...)</option>";
+      });
+    }
+    sel.onchange = function() {
+      currentDevice = sel.value;
+      document.getElementById("startBtn").disabled = !currentDevice || streamActive;
+      if (streamActive) stopStream();
+    };
+    if (!cur && currentDevice) sel.value = currentDevice;
+  } catch(e) { log("devices: "+e); }
+}
+
+function updateStatus(text, cls) {
+  var el = document.getElementById("status");
+  el.textContent = text;
+  el.className = "status " + cls;
+}
+
+async function startStream() {
+  if (!currentDevice) return;
+  updateStatus("Starting...", "waiting");
+  document.getElementById("startBtn").disabled = true;
+
+  try {
+    await fetch(API + "/stream-stop?device_id=" + currentDevice + "&api_key=" + API_KEY,
+      {headers: {"X-Api-Key": API_KEY}});
+    await new Promise(function(r){setTimeout(r,500)});
+  } catch(e) {}
+
+  try {
+    var r = await fetch(API + "/stream-start?device_id=" + currentDevice + "&fps=20&bitrate=2M&api_key=" + API_KEY,
+      {headers: {"X-Api-Key": API_KEY}});
+    var data = await r.json();
+    log("start: " + JSON.stringify(data));
+    if (data.error && data.status !== "already_running") {
+      updateStatus("Error: " + data.error, "error");
+      document.getElementById("startBtn").disabled = false;
+      return;
+    }
+  } catch(e) {
+    updateStatus("Start failed: " + e, "error");
+    document.getElementById("startBtn").disabled = false;
+    return;
+  }
+
+  // multipart MJPEG — <img> native support, zero JS overhead per frame
+  img.src = "/stream-mjpeg?device_id=" + currentDevice + "&_=" + Date.now();
+  img.style.display = "block";
+  document.getElementById("placeholder").style.display = "none";
+  streamActive = true;
+  frameCount = 0;
+  fpsTimer = performance.now();
+
+  img.onload = img.onerror = function() {
+    frameCount++;
+  };
+
+  updateStatus("Live", "live");
+  document.getElementById("stopBtn").disabled = false;
+  document.getElementById("startBtn").disabled = true;
+
+  (function fpsLoop() {
+    if (!streamActive) return;
+    setTimeout(fpsLoop, 1000);
+    var elapsed = (performance.now() - fpsTimer) / 1000;
+    var fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : 0;
+    document.getElementById("fps").textContent = "FPS: " + fps;
+    document.getElementById("frames").textContent = "Frames: " + frameCount;
+  })();
+}
+
+async function stopStream() {
+  streamActive = false;
+  img.src = "";
+  img.style.display = "none";
+  document.getElementById("placeholder").style.display = "block";
+
+  try {
+    await fetch(API + "/stream-stop?device_id=" + currentDevice + "&api_key=" + API_KEY,
+      {headers: {"X-Api-Key": API_KEY}});
+  } catch(e) {}
+
+  updateStatus("Stopped", "waiting");
+  document.getElementById("startBtn").disabled = !currentDevice;
+  document.getElementById("stopBtn").disabled = true;
+  document.getElementById("fps").textContent = "FPS: --";
+  document.getElementById("frames").textContent = "Frames: 0";
+}
+
+loadDevices();
+setInterval(loadDevices, 30000);
+</script>
+</body>
+</html>

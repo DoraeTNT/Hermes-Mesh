@@ -171,7 +171,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _check_auth(self):
         """验证 API 认证，/api/health 和主页免认证"""
         path_base = self.path.split("?")[0]
-        if path_base in ("/", "/index.html", "/api/health", "/api/devices", "/api/events"):
+        if path_base in ("/", "/index.html", "/api/health", "/api/devices", "/api/events", "/video", "/flow", "/project"):
             return True
         api_key = self.headers.get("X-Api-Key", "")
         # 也支持 URL 查询参数（MJPEG 流等场景无法自定义 header）
@@ -211,6 +211,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._html(f.read())
             except:
                 self._json({"error": "project diagram not found"}, 404)
+            return
+        elif path_base == "/video":
+            video_path = os.path.join(os.path.dirname(__file__), "video.html")
+            try:
+                with open(video_path) as f:
+                    self._html(f.read())
+            except:
+                self._json({"error": "video page not found"}, 404)
             return
 
         if path_base == "/api/devices":
@@ -268,6 +276,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "fps": int(fps),
                 "bitrate": bitrate,
             }, device_id=device_id, timeout=10)
+            self._json(result)
+        elif path_base == "/api/stream-stop":
+            # 下发 stream_stop 命令给 Agent
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = dict(p.split("=") for p in qs.split("&") if "=" in p) if qs else {}
+            device_id = params.get("device_id", "")
+            if not device_id:
+                self._json({"error": "device_id required"}, 400)
+                return
+            result = bridge_signed_call("stream_stop", {}, device_id=device_id, timeout=10)
             self._json(result)
         elif path_base == "/api/stream-meta":
             # 代理到 Bridge（stream_manager 状态在 Bridge 进程中）
@@ -429,8 +447,13 @@ th{color:#8b949e;font-weight:500;font-size:11px;text-transform:uppercase}
 </head>
 <body>
 <div class="header">
-  <div><h1>🔧 Hermes GUI Agent 看板</h1></div>
-  <div class="time" id="serverTime">加载中...</div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <h1> Hermes GUI Agent </h1>
+    <a href="video" style="color:#58a6ff;text-decoration:none;font-size:13px;padding:4px 12px;border:1px solid #30363d;border-radius:4px"> Stream</a>
+    <a href="flow" style="color:#8b949e;text-decoration:none;font-size:13px;padding:4px 12px;border:1px solid #30363d;border-radius:4px">Flow</a>
+    <a href="project" style="color:#8b949e;text-decoration:none;font-size:13px;padding:4px 12px;border:1px solid #30363d;border-radius:4px">Project</a>
+  </div>
+  <div class="time" id="serverTime">...</div>
 </div>
 
 <div class="grid">

@@ -100,7 +100,7 @@ TLS_KEY_FILE     = get("TLS_KEY_FILE",  os.path.expanduser("~/.hermes/certs/serv
 TLS_CA_FILE      = get("TLS_CA_FILE",   os.path.expanduser("~/.hermes/certs/ca.crt"))  # Agent 端校验用
 
 # ── 文件路径 ──
-UPDATE_DIR       = get("UPDATE_DIR", "/home/admin/hermes_gui_agent")
+UPDATE_DIR       = get("UPDATE_DIR", "/home/admin/Worker/Hermes Mesh/hermes_gui_agent")
 SCREENSHOTS_DIR  = os.path.join(UPDATE_DIR, "screenshots")
 VERSIONS_FILE    = os.path.join(UPDATE_DIR, "versions.json")
 

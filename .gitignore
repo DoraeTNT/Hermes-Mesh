@@ -1,2 +1,31 @@
+# 加密配置（含密钥，绝不入库）
 client/_enc_config.py
-client/__pycache__/
+modules/_enc_config.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+cache/
+screenshots/
+audit.log
+.device_id
+
+# Env
+.env
+.venv/
