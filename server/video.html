@@ -115,18 +115,6 @@ async function startStream() {
     return;
   }
 
-  // multipart MJPEG — <img> native support, zero JS overhead per frame
-  img.src = "/stream-mjpeg?device_id=" + currentDevice + "&_=" + Date.now();
-  img.style.display = "block";
-  document.getElementById("placeholder").style.display = "none";
-  streamActive = true;
-  frameCount = 0;
-  fpsTimer = performance.now();
-
-  img.onload = img.onerror = function() {
-    frameCount++;
-  };
-
   updateStatus("Live", "live");
   document.getElementById("stopBtn").disabled = false;
   document.getElementById("startBtn").disabled = true;

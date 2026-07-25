@@ -174,7 +174,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path_base in ("/", "/index.html", "/api/health", "/api/devices", "/api/events", "/video", "/flow", "/project"):
             return True
         api_key = self.headers.get("X-Api-Key", "")
-        # 也支持 URL 查询参数（MJPEG 流等场景无法自定义 header）
+        # 也支持 URL 查询参数
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
         params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p) if qs else {}
         if not api_key:
@@ -559,7 +559,7 @@ async function fetchJSON(url) {
   try {
     const opts = {};
     if (API_KEY) opts.headers = {'X-Api-Key': API_KEY};
-    // URL 也附带 api_key（兼容 MJPEG 等场景）
+    // URL 也附带 api_key
     const sep = url.includes('?') ? '&' : '?';
     const r = await fetch(API_KEY ? url + sep + 'api_key=' + encodeURIComponent(API_KEY) : url, opts);
     return await r.json();

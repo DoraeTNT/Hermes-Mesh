@@ -241,7 +241,7 @@ class TCPServer:
                 if msg.get("type") == "stream":
                     try:
                         import base64 as _b64
-                        from hermes.stream_manager import feed_stream, feed_mjpeg
+                        from hermes.stream_manager import feed_stream
                         global _ts_bytes_total, _ts_pkt_total, _ts_last_report
                         ts_data = _b64.b64decode(msg.get("data", ""))
                         did = conn.device_id
@@ -258,7 +258,6 @@ class TCPServer:
                             _ts_last_report = now
                         # 线程池执行，避免 FFmpeg 管道阻塞事件循环
                         _stream_executor.submit(feed_stream, did, ts_data)
-                        _stream_executor.submit(feed_mjpeg, did, ts_data)
                     except Exception as e:
                         logger.warning("STREAM error: %s", e)
                     continue
@@ -322,9 +321,8 @@ class TCPServer:
             # 清理该设备的视频流，避免 FFmpeg 进程与读取线程泄漏
             if removed:
                 try:
-                    from hermes.stream_manager import stop_stream, stop_mjpeg
+                    from hermes.stream_manager import stop_stream
                     stop_stream(conn.device_id)
-                    stop_mjpeg(conn.device_id)
                 except Exception as e:
                     logger.warning("Stream cleanup failed for %s: %s", conn.device_name, e)
             try:
@@ -527,45 +525,6 @@ class APIHandler(BaseHTTPRequestHandler):
                             raise
                         last_id = max(last_id, sid)
                     if not segments:
-                        time.sleep(0.05)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                session.client_count = max(0, session.client_count - 1)
-        elif path_base == "/stream-mjpeg":
-            # MJPEG multipart — 直推 JPEG 帧，浏览器 <img> 原生支持
-            device_id = params.get("device_id", "")
-            if not device_id:
-                self._json({"error": "device_id required"}, 400)
-                return
-            from hermes.stream_manager import get_or_create_mjpeg
-            session = get_or_create_mjpeg(device_id)
-
-            boundary = b"--hermesmjpeg"
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=hermesmjpeg")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            session.client_count += 1
-            last_id = 0
-            try:
-                while session.active or len(session.frames) > 0:
-                    frames = session.get_frames_since(last_id)
-                    for fid, data in frames:
-                        hdr = (b"--hermesmjpeg\r\n"
-                               b"Content-Type: image/jpeg\r\n"
-                               b"Content-Length: " + str(len(data)).encode() + b"\r\n"
-                               b"\r\n")
-                        try:
-                            self.wfile.write(hdr + data + b"\r\n")
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError):
-                            raise
-                        last_id = max(last_id, fid)
-                    if not frames:
                         time.sleep(0.05)
             except (BrokenPipeError, ConnectionResetError):
                 pass
