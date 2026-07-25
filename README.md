@@ -112,7 +112,7 @@ hermes_gui_agent/
 - 支持调用 Bridge API，将 AI 决策转化为远程操作
 
 ### 实时视频流
-- FFmpeg 采集 Windows 桌面 (gdigrab)
+- FFmpeg 采集 Windows 桌面（🚧 开发中，尚未实现）
 - H.264 编码 → fMP4 分段 → MediaSource API 浏览器播放
 - MJPEG 备用方案（`<img>` 标签原生支持）
 - 自动清理断开设备的 FFmpeg 进程（防内存泄漏）
