@@ -258,6 +258,8 @@ class TCPServer:
                             _ts_last_report = now
                         # 线程池执行
                         _stream_executor.submit(feed_stream, did, ts_data)
+                        if _ts_pkt_total == 1:
+                            logger.info("[BRIDGE] First TS chunk: %d bytes (decoded)", len(ts_data))
                     except Exception as e:
                         logger.warning("STREAM error: %s", e)
                     continue
@@ -484,8 +486,52 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             from hermes.stream_manager import get_stream_status
             self._json(get_stream_status(device_id))
+        elif path_base == "/stream-fmp4":
+            # fMP4 live — <video> tag plays natively, no MSE needed
+            device_id = params.get("device_id", "")
+            if not device_id:
+                self._json({"error": "device_id required"}, 400)
+                return
+            from hermes.stream_manager import get_or_create_stream
+            session = get_or_create_stream(device_id)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            session.client_count += 1
+            init_sent = False
+            last_seq = 0
+            try:
+                while session.active or len(session._segments) > 0:
+                    if not init_sent:
+                        init = session.get_init()
+                        if init:
+                            self.wfile.write(init)
+                            self.wfile.flush()
+                            init_sent = True
+                            continue
+                    if init_sent:
+                        segs = session.get_segments_since(last_seq)
+                        for seq, data in segs:
+                            try:
+                                self.wfile.write(data)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError):
+                                raise
+                            last_seq = max(last_seq, seq)
+                        if not segs:
+                            time.sleep(0.05)
+                    else:
+                        time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                session.client_count = max(0, session.client_count - 1)
         elif path_base == "/stream-sse":
-            # SSE — raw TS chunks (base64), browser demuxes with mux.js
+            # SSE — raw TS chunks (base64)
             import base64
             device_id = params.get("device_id", "")
             if not device_id:
@@ -512,6 +558,44 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                         last_seq = max(last_seq, seq)
                     if not chunks:
+                        time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                session.client_count = max(0, session.client_count - 1)
+        elif path_base == "/stream-mjpeg":
+            # MJPEG multipart — works on every browser (no MSE required)
+            device_id = params.get("device_id", "")
+            if not device_id:
+                self._json({"error": "device_id required"}, 400)
+                return
+            from hermes.stream_manager import get_or_create_stream
+            session = get_or_create_stream(device_id)
+
+            boundary = b"--hermesmjpeg"
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=hermesmjpeg")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            session.client_count += 1
+            last_id = 0
+            try:
+                while session.active or len(session.frames) > 0:
+                    frames = session.get_frames_since(last_id)
+                    for fid, data in frames:
+                        hdr = (b"--hermesmjpeg\r\n"
+                               b"Content-Type: image/jpeg\r\n"
+                               b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n")
+                        try:
+                            self.wfile.write(hdr + data + b"\r\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            raise
+                        last_id = max(last_id, fid)
+                    if not frames:
                         time.sleep(0.05)
             except (BrokenPipeError, ConnectionResetError):
                 pass

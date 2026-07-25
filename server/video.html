@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Video Stream - Hermes GUI Agent</title>
-<script src="https://cdn.jsdelivr.net/npm/mux.js@7.0.3/dist/mux.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
@@ -20,7 +19,7 @@ body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;height:10
 .status.waiting{color:#f0883e}
 .status.error{color:#f85149}
 #videoContainer{flex:1;display:flex;align-items:center;justify-content:center;background:#000;min-height:0;overflow:hidden}
-#video{max-width:100%;max-height:100%}
+#streamImg{max-width:100%;max-height:100%;object-fit:contain}
 #placeholder{color:#484f58;font-size:14px}
 .info-bar{padding:8px 20px;font-size:11px;color:#484f58;background:#161b22;border-top:1px solid #30363d;flex-shrink:0;display:flex;gap:16px}
 </style>
@@ -37,12 +36,12 @@ body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;height:10
   <span id="status" class="status waiting">Not Connected</span>
 </div>
 <div id="videoContainer">
-  <video id="video" muted autoplay playsinline style="display:none"></video>
+  <video id="video" muted autoplay playsinline style="max-width:100%;max-height:100%;display:none"></video>
   <div id="placeholder">Select a device and click Start Stream</div>
 </div>
 <div class="info-bar">
   <span id="fps">FPS: --</span>
-  <span id="frames">Chunks: 0</span>
+  <span id="frames">Frames: 0</span>
 </div>
 
 <script>
@@ -50,64 +49,13 @@ var DK = "";
 var API_KEY = new URLSearchParams(window.location.search).get("api_key") || DK;
 var API = window.location.pathname.replace(/\/video$/, "").replace(/\/$/, "") + "/api";
 
+var video = document.getElementById("video");
 var streamActive = false;
 var currentDevice = "";
-var chunkCount = 0;
+var frameCount = 0;
 var fpsTimer = 0;
-var eventSource = null;
-
-// MSE setup
-var mediaSource = null;
-var sourceBuffer = null;
-var transmuxer = null;
-var videoEl = document.getElementById("video");
-var pendingChunks = [];
-var sbReady = false;
 
 function log(msg) { console.log("[VIDEO] " + msg); }
-
-function initMSE() {
-  if (mediaSource) return;
-  mediaSource = new MediaSource();
-  videoEl.src = URL.createObjectURL(mediaSource);
-
-  mediaSource.addEventListener("sourceopen", function() {
-    log("MediaSource opened");
-    try {
-      sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.4D401E"');
-      sourceBuffer.mode = "sequence";
-      sourceBuffer.addEventListener("updateend", function() {
-        sbReady = true;
-        flushPending();
-      });
-      sourceBuffer.addEventListener("error", function(e) { log("SB error: " + e); });
-      sbReady = true;
-    } catch(e) {
-      log("addSourceBuffer failed: " + e);
-      updateStatus("Codec not supported", "error");
-    }
-  });
-
-  mediaSource.addEventListener("sourceended", function() { log("MediaSource ended"); });
-  mediaSource.addEventListener("error", function() { log("MediaSource error"); });
-}
-
-function flushPending() {
-  while (sbReady && pendingChunks.length > 0) {
-    var chunk = pendingChunks.shift();
-    try {
-      if (!sourceBuffer.updating) {
-        sourceBuffer.appendBuffer(chunk);
-        sbReady = false;
-      } else {
-        pendingChunks.unshift(chunk);
-        break;
-      }
-    } catch(e) {
-      log("appendBuffer error: " + e);
-    }
-  }
-}
 
 async function loadDevices() {
   try {
@@ -166,44 +114,23 @@ async function startStream() {
     return;
   }
 
-  // Init MSE + transmuxer
-  initMSE();
-  if (typeof muxjs !== "undefined") {
-    transmuxer = new muxjs.mp4.Transmuxer();
-    transmuxer.on("data", function(segment) {
-      var data = new Uint8Array(segment.initSegment.byteLength + segment.data.byteLength);
-      data.set(new Uint8Array(segment.initSegment), 0);
-      data.set(new Uint8Array(segment.data), segment.initSegment.byteLength);
-      pendingChunks.push(data.buffer);
-      flushPending();
-      chunkCount++;
-    });
-  }
-
-  // Connect SSE for TS data
-  var sseUrl = window.location.protocol + "//" + window.location.host + "/stream-sse?device_id=" + currentDevice;
-  log("SSE: " + sseUrl);
-  eventSource = new EventSource(sseUrl);
-  eventSource.onmessage = function(e) {
-    if (!streamActive) return;
-    try {
-      var b64 = e.data;
-      var binary = atob(b64);
-      var bytes = new Uint8Array(binary.length);
-      for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      if (transmuxer) {
-        transmuxer.push(bytes);
-        transmuxer.flush();
-      }
-    } catch(err) { log("chunk error: " + err); }
-  };
-  eventSource.onerror = function() { log("SSE error"); };
-
-  streamActive = true;
-  chunkCount = 0;
-  fpsTimer = performance.now();
-  videoEl.style.display = "block";
+  // Play fMP4 via <video> tag — works on all browsers
+  var streamUrl = "/stream-fmp4?device_id=" + currentDevice + "&_=" + Date.now();
+  video.src = streamUrl;
+  video.style.display = "block";
+  video.play().catch(function(e) { log("play error: " + e); });
   document.getElementById("placeholder").style.display = "none";
+  streamActive = true;
+  frameCount = 0;
+  fpsTimer = performance.now();
+
+  // Monitor for video playback
+  video.onplay = function() { updateStatus("Live", "live"); };
+  video.onerror = function() { updateStatus("Stream error", "error"); };
+  video.onwaiting = function() { updateStatus("Buffering...", "waiting"); };
+
+  video.ontimeupdate = function() { frameCount++; };
+
   updateStatus("Live", "live");
   document.getElementById("stopBtn").disabled = false;
   document.getElementById("startBtn").disabled = true;
@@ -213,24 +140,17 @@ async function startStream() {
     if (!streamActive) return;
     setTimeout(fpsLoop, 1000);
     var elapsed = (performance.now() - fpsTimer) / 1000;
-    var fps = elapsed > 0 ? (chunkCount / elapsed).toFixed(1) : 0;
+    var fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : 0;
     document.getElementById("fps").textContent = "FPS: " + fps;
-    document.getElementById("frames").textContent = "Chunks: " + chunkCount;
+    document.getElementById("frames").textContent = "Frame: " + frameCount;
   })();
+
 }
 
 async function stopStream() {
   streamActive = false;
-  if (eventSource) { eventSource.close(); eventSource = null; }
-  if (transmuxer) { transmuxer.dispose(); transmuxer = null; }
-  if (mediaSource && mediaSource.readyState === "open") {
-    try { mediaSource.endOfStream(); } catch(e) {}
-  }
-  mediaSource = null;
-  sourceBuffer = null;
-  sbReady = false;
-  pendingChunks = [];
-  videoEl.style.display = "none";
+  video.src = "";
+  video.style.display = "none";
   document.getElementById("placeholder").style.display = "block";
 
   try {
@@ -242,7 +162,7 @@ async function stopStream() {
   document.getElementById("startBtn").disabled = !currentDevice;
   document.getElementById("stopBtn").disabled = true;
   document.getElementById("fps").textContent = "FPS: --";
-  document.getElementById("frames").textContent = "Chunks: 0";
+  document.getElementById("frames").textContent = "Frame: 0";
 }
 
 loadDevices();
