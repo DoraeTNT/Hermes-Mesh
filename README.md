@@ -1,38 +1,28 @@
 # Hermes GUI Agent
 
-AI 驱动的 Windows 自动化运维平台。通过云端技能分发 + Windows Agent 后台执行，实现鼠标键盘操控、文件检索、病毒查杀、系统修复等自动化能力。AI 作为决策引擎，通过自然语言对话即可完成复杂运维任务。
+让 Windows 电脑接入 Hermes 平台的 Agent 客户端。安装后，Windows 主机可通过 Bridge 长连接使用 Hermes 的技能（Skills）、AI 对话、截图分析等能力，实现鼠标键盘操控、文件检索、病毒查杀、系统修复等自动化运维。
 
-## 核心能力
+## 工作原理
 
 ```
-你说"帮我检查这台电脑有没有病毒" 
-    → Chat Server (DeepSeek 理解意图)
-    → Bridge 下发技能指令
-    → Windows Agent 后台执行（进程扫描、文件检索、注册表检查）
-    → 结果回传，AI 分析并给出建议
+Windows 装 Agent → 连上 Bridge → 这台电脑就能用 Hermes 的全部能力了
+                                    ↑
+                            你说"查一下有没有病毒"
+                            Chat Server 理解意图 → 调用对应 Skill
+                            → Agent 在 Windows 上后台执行
+                            → 结果回传 AI 分析
 ```
 
-### Windows Agent 能做什么
+## Windows 装上 Agent 后能用什么
 
-| 能力 | 实现方式 | 用途 |
-|------|----------|------|
-| 🖱️ 鼠标键盘操控 | ctypes 直接发送输入事件 | 操作任意桌面应用 |
-| 📸 截图分析 | mss 快速截图 + vision 模型识别 | 定位 UI 元素、验证操作结果 |
-| 🔍 后台文件检索 | cmd 命令执行 | 全盘搜索、文件内容检查 |
-| 🛡️ 病毒查杀 | 多引擎扫描（进程/签名/网络/持久化 7 层 41+ 检查项） | 安全运维 |
-| 🔧 系统修复 | 自动诊断 + 修复 | Windows 常见问题一键修复 |
-| 📋 剪贴板读写 | Win32 clipboard API | 数据传输 |
-
-### 技能分发体系
-
-Hermes 云端维护了一套技能库，通过 Bridge 下发给 Windows Agent：
-
-- **windows-malware-scan** — 恶意软件全面扫描（7 层 41+ 检查项）
-- **windows-repair** — 系统诊断与自动修复
-- **windows-mouse-precision** — 视觉定位 + 反馈闭环的精准鼠标操作
-- **windows-cmd-reference** — 120+ 常用 Windows 命令速查
-
-Agent 收到技能指令后本地执行，结果回传 AI 分析，全程无需人工远程桌面。
+| 能力 | 说明 |
+|------|------|
+| 🖱️ 鼠标键盘操控 | 模拟真人操作桌面应用 |
+| 📸 截图 + AI 分析 | 视觉模型识别界面元素、验证结果 |
+| 🔍 文件检索 | 全盘搜索、内容扫描 |
+| 🛡️ 病毒查杀 | 进程/签名/网络/持久化 7 层检查 |
+| 🔧 系统修复 | 自动诊断 Windows 常见问题 |
+| 💬 AI 对话 | 接入 Hermes Skill 体系，LLM 驱动的交互 |
 
 ## 架构
 
