@@ -1,6 +1,6 @@
 # Hermes GUI Agent
 
-让 Windows 电脑接入 Hermes 平台的 Agent 客户端。安装后，Windows 主机可通过 Bridge 长连接使用 Hermes 的技能（Skills）、AI 对话、截图分析等能力，实现鼠标键盘操控、文件检索、病毒查杀、系统修复等自动化运维。
+让主机设备接入 Hermes 平台的 Agent 客户端。安装后，Windows 主机可通过 Bridge 长连接使用 Hermes 的技能（Skills）、AI 对话、截图分析等能力，实现鼠标键盘操控、文件检索、病毒查杀、系统修复等自动化运维。
 
 ## 工作原理
 
