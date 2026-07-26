@@ -30,3 +30,13 @@ audit.log
 # Env
 .env
 .venv/
+
+# Local credentials and one-off recovery downloads
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
+*_download
+modules/*_dl.txt
+h264-stream-fix-*.zip

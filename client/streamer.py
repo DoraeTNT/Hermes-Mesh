@@ -17,6 +17,7 @@ _stream_fps = 20
 _stream_bitrate = "2M"
 _stream_width = 0
 _stream_height = 0
+MAX_STREAM_WIDTH = 1280
 
 # ── 调试日志 ──
 _DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streamer_debug.log")
@@ -120,27 +121,30 @@ def _detect_encoder():
 
 def _build_ffmpeg_cmd(ffmpeg_path, encoder, encoder_opts):
     global _stream_fps, _stream_width, _stream_height
+    keyframe_interval = max(1, _stream_fps // 2)
 
     cmd = [ffmpeg_path,
-           "-f", "gdigrab",
-           "-framerate", str(_stream_fps),
-           "-i", "desktop",
+           # Desktop Duplication is considerably more reliable than gdigrab
+           # for a high-DPI desktop. dup_frames also keeps a steady output
+           # cadence when the desktop is momentarily static.
+           "-f", "lavfi",
+           "-i", f"ddagrab=output_idx=0:framerate={_stream_fps}:draw_mouse=1:dup_frames=1",
+           "-vf", f"hwdownload,format=bgra,scale={MAX_STREAM_WIDTH}:-2:flags=fast_bilinear:force_original_aspect_ratio=decrease",
            "-c:v", encoder,
            *encoder_opts,
            "-pix_fmt", "yuv420p",
            "-profile:v", "main",
            "-level", "4.0",
-           "-g", str(_stream_fps * 2),
-           "-keyint_min", str(_stream_fps),
+           "-g", str(keyframe_interval),
+           "-keyint_min", str(keyframe_interval),
            "-sc_threshold", "0",
            "-an",
            # Output fMP4 with empty moov + fragments at each keyframe
            "-f", "mp4",
            "-movflags", "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
-           "-frag_duration", "500000",  # 0.5s fragments
+           "-frag_duration", "250000",  # 0.25s fragments for lower latency
            "pipe:1",
            ]
-    # No resolution scaling — we pass through as-is for speed
     return cmd
 
 
@@ -181,11 +185,13 @@ def _extract_fmp4_segments(data: bytes):
                         segments.append(bytes(buf[offset:seg_end]))
                         offset = seg_end
                         continue
-            # mdat not found immediately after moof — just send moof alone
-            segments.append(bytes(buf[offset:offset+size]))
+            # stdout reads can split moof from mdat. Keep this incomplete pair
+            # buffered; MSE rejects a bare moof as a media segment.
+            break
         elif box_type == _MDAT and not init:
-            # mdat without prior moof — probably partial, skip
-            pass
+            # Preserve an orphaned/partial mdat so the next read can be parsed
+            # with its preceding complete fragment instead of discarding bytes.
+            break
 
         offset += size
 

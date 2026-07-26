@@ -364,6 +364,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if s:
                     try: s.close()
                     except: pass
+        elif path_base == "/api/stream-fmp4":
+            # Native <video> fallback for browsers or embedded webviews without MSE.
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            import socket as _sock
+            s = None
+            try:
+                s = _sock.create_connection(("127.0.0.1", config.BRIDGE_HTTP_PORT), timeout=10)
+                s.sendall(f"GET /stream-fmp4?{qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode())
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("Bridge closed the fMP4 stream")
+                    buf += chunk
+                header_end = buf.index(b"\r\n\r\n") + 4
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                body_tail = buf[header_end:]
+                if body_tail:
+                    self.wfile.write(body_tail)
+                    self.wfile.flush()
+                s.settimeout(0.5)
+                while True:
+                    try:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except _sock.timeout:
+                        continue
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                logger.warning("fMP4 proxy failed: %s", e)
+                if not self.wfile.closed:
+                    self._json({"error": str(e)}, 502)
+            finally:
+                if s:
+                    try: s.close()
+                    except: pass
         else:
             self._json({"error": "not found"}, 404)
 
@@ -548,12 +594,15 @@ th{color:#8b949e;font-weight:500;font-size:11px;text-transform:uppercase}
 <div class="refresh-indicator" id="refreshInfo">自动刷新: 5s | 上次: --</div>
 
 <script>
-const DEFAULT_API_KEY = "";
 const BASE = window.location.pathname.replace(/\/+$/, '');
 const API = BASE + '/api';
-// 从 URL 参数读取 API Key（例如 /dashboard/?key=xxx）
+// Prefer a key supplied in the URL, then reuse the current browser session.
 const urlParams = new URLSearchParams(window.location.search);
-const API_KEY = urlParams.get('api_key') || (typeof DEFAULT_API_KEY!=='undefined'?DEFAULT_API_KEY:'');
+let API_KEY = urlParams.get('api_key') || sessionStorage.getItem('hermes_dashboard_api_key') || '';
+if (!API_KEY) {
+  API_KEY = (window.prompt('请输入 Dashboard API Key 以启用受保护的操作：') || '').trim();
+}
+if (API_KEY) sessionStorage.setItem('hermes_dashboard_api_key', API_KEY);
 
 async function fetchJSON(url) {
   try {
@@ -603,7 +652,37 @@ let eventSource = null;
 let initSegment = null;
 let frameCount = 0;
 let fpsTimer = 0;
+let fpsInterval = null;
+let pendingSegments = [];
 let mseReady = false;
+let livePaused = false;
+
+// An SSE message is an fMP4 fragment (normally about 0.5 seconds), not a
+// video frame. Count the samples declared by its `trun` box for a real FPS.
+function fmp4SampleCount(bytes) {
+  for (let i = 4; i + 12 <= bytes.length; i++) {
+    if (bytes[i] === 0x74 && bytes[i + 1] === 0x72 &&
+        bytes[i + 2] === 0x75 && bytes[i + 3] === 0x6e) {
+      return (((bytes[i + 8] << 24) | (bytes[i + 9] << 16) |
+               (bytes[i + 10] << 8) | bytes[i + 11]) >>> 0);
+    }
+  }
+  return 0;
+}
+
+// SourceBuffer accepts only one asynchronous append at a time. Keep incoming
+// fMP4 fragments until updateend instead of silently dropping them.
+function appendPendingSegment() {
+  if (!sourceBuffer || !mseReady || sourceBuffer.updating || !pendingSegments.length) return;
+  try {
+    sourceBuffer.appendBuffer(pendingSegments.shift());
+  } catch (e) {
+    pendingSegments = [];
+    const errEl = document.getElementById('liveError');
+    errEl.textContent = 'MSE append error: ' + e.message;
+    errEl.style.display = 'block';
+  }
+}
 
 function startLiveView() {
   const sel = document.getElementById('liveDevice');
@@ -620,15 +699,37 @@ function startLiveView() {
   const errEl = document.getElementById('liveError');
   const fpsEl = document.getElementById('liveFPS');
   const pauseBtn = document.getElementById('livePauseBtn');
+  let nativePlayback = false;
+  frameCount = 0;
+  fpsTimer = performance.now();
+  pendingSegments = [];
+  livePaused = false;
+  if (fpsInterval) { clearInterval(fpsInterval); fpsInterval = null; }
 
   // 显示进度
   placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 1/4: 发送 stream_start 命令</small>';
   placeholder.style.display = 'block';
   errEl.style.display = 'none';
 
-  // 发送 stream_start 命令给 Agent
+  // Start the stream before polling its metadata. If a previous stream is
+  // already running, restart it so the client emits a fresh fMP4 init segment.
   const streamStartUrl = API + '/stream-start?device_id=' + newId + '&fps=20&bitrate=2M' + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
-  fetch(streamStartUrl).catch(() => {});
+  const streamStopUrl = API + '/stream-stop?device_id=' + newId + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
+  async function ensureStreamStarted() {
+    let response = await fetch(streamStartUrl);
+    let result = await response.json();
+    if (!response.ok || result.error) throw new Error(result.error || 'stream_start failed');
+    if (result.status === 'already_running') {
+      await fetch(streamStopUrl);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      response = await fetch(streamStartUrl);
+      result = await response.json();
+      if (!response.ok || result.error || result.status === 'already_running') {
+        throw new Error(result.error || 'could not restart the existing stream');
+      }
+    }
+    return result;
+  }
 
   // 获取 init segment（带重试，因为 -c copy 的 init 需要等待 TS 数据来修补 avc1）
   placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 2/4: 获取 init segment</small>';
@@ -640,19 +741,22 @@ function startLiveView() {
   
   function fetchMeta() {
     return fetch(metaUrl).then(r => r.json()).then(meta => {
-      if (meta.error) {
+      // A stream session is created before FFmpeg emits ftyp/moov. Treat a
+      // missing init segment as pending, rather than failing on the first poll.
+      if (meta.error || !meta.init_b64) {
         metaRetries++;
         if (metaRetries < maxMetaRetries) {
-          placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 2/4: 等待 init segment (' + metaRetries + '/' + maxMetaRetries + ')</small>';
+          const reason = meta.error || '等待 H.264 初始化段';
+          placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 2/4: ' + reason + ' (' + metaRetries + '/' + maxMetaRetries + ')</small>';
           return new Promise(resolve => setTimeout(resolve, 250)).then(fetchMeta);
         }
-        throw new Error(meta.error);
+        throw new Error(meta.error || 'Timed out waiting for the H.264 initialization segment');
       }
       return meta;
     });
   }
   
-  fetchMeta()
+  ensureStreamStarted().then(fetchMeta)
     .then(meta => {
       if (meta.error) {
         placeholder.style.display = 'none';
@@ -660,10 +764,19 @@ function startLiveView() {
         errEl.style.display = 'block';
         throw new Error(meta.error);
       }
-      placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 3/4: 初始化 MSE (' + (meta.init_b64 ? meta.init_b64.length : 0) + ' bytes init)</small>';
+      if (!meta.init_b64) {
+        throw new Error('Server has not received the H.264 initialization segment yet');
+      }
+      if (!window.MediaSource) {
+        nativePlayback = true;
+        placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">使用原生 H.264 播放回退</small>';
+        return setupNativeFmp4(video, newId);
+      }
+      placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 3/4: 初始化 MSE (' + meta.init_b64.length + ' bytes init)</small>';
       return setupMSE(video, meta);
     })
     .then(() => {
+      if (nativePlayback) return;
       placeholder.innerHTML = '正在启动视频流...<br><small style="color:#30363d">Step 4/4: 连接 SSE 视频流</small>';
       // 连接 SSE 获取 fMP4 segments
       const sseUrl = API + '/stream-sse?device_id=' + newId + (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '');
@@ -674,17 +787,15 @@ function startLiveView() {
       };
       eventSource.onmessage = (e) => {
         try {
-          fpsEl.textContent = 'got msg';
-          if (!sourceBuffer || sourceBuffer.updating) { fpsEl.textContent = 'sb busy'; return; }
-          if (!mseReady) { fpsEl.textContent = 'waiting MSE'; return; }
           let binary = atob(e.data);
           let bytes = new Uint8Array(binary.length);
           for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          sourceBuffer.appendBuffer(bytes);
-          frameCount++;
-          fpsEl.textContent = 'Frames: ' + frameCount;
-          if (!fpsTimer) fpsTimer = performance.now();
-          if (video.paused) video.play().catch(() => {});
+          frameCount += fmp4SampleCount(bytes);
+          pendingSegments.push(bytes);
+          // Retain a short live window if the browser was backgrounded.
+          if (pendingSegments.length > 30) pendingSegments.splice(0, pendingSegments.length - 30);
+          appendPendingSegment();
+          if (video.paused && !livePaused) video.play().catch(() => {});
           if (placeholder.style.display !== 'none') {
             video.style.display = 'block';
             placeholder.style.display = 'none';
@@ -692,7 +803,7 @@ function startLiveView() {
             pauseBtn.textContent = '⏸ 暂停';
           }
           // Force seek to buffered range if video is stuck at t=0 with data elsewhere
-          if (video.readyState < 2 && sourceBuffer && sourceBuffer.buffered.length > 0) {
+          if (!livePaused && video.readyState < 2 && sourceBuffer && sourceBuffer.buffered.length > 0) {
             const start = sourceBuffer.buffered.start(0);
             if (Math.abs(video.currentTime - start) > 0.5) {
               video.currentTime = start;
@@ -713,7 +824,7 @@ function startLiveView() {
       };
 
       // FPS 计数器
-      setInterval(() => {
+      fpsInterval = setInterval(() => {
         if (frameCount > 0 && fpsTimer) {
           const elapsed = (performance.now() - fpsTimer) / 1000;
           const fps = Math.round(frameCount / elapsed);
@@ -731,9 +842,8 @@ function startLiveView() {
 
 async function setupMSE(video, meta) {
   const initB64 = meta.init_b64;
-  if (!initB64 || !window.MediaSource) {
-    throw new Error('Browser does not support MediaSource Extensions');
-  }
+  if (!initB64) throw new Error('Server has not received the H.264 initialization segment yet');
+  if (!window.MediaSource) throw new Error('Browser does not support MediaSource Extensions');
   const binary = atob(initB64);
   initSegment = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) initSegment[i] = binary.charCodeAt(i);
@@ -745,8 +855,22 @@ async function setupMSE(video, meta) {
     let resolved = false;
     mediaSource.addEventListener('sourceopen', () => {
       try {
-        // Comprehensive H.264 codec list — video-only + audio variants
+        // Read profile/compatibility/level from avcC. Choosing a broadly
+        // supported but different profile (for example 42E01E vs 42C028)
+        // makes appendBuffer fail even when H.264 itself is supported.
+        let streamCodec = null;
+        for (let i = 0; i + 7 < initSegment.length; i++) {
+          if (initSegment[i] === 0x61 && initSegment[i + 1] === 0x76 &&
+              initSegment[i + 2] === 0x63 && initSegment[i + 3] === 0x43) {
+            streamCodec = 'avc1.' + [initSegment[i + 5], initSegment[i + 6], initSegment[i + 7]]
+              .map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+            break;
+          }
+        }
+        // Use the stream's declared codec first, then retain fallbacks for
+        // malformed legacy init segments.
         const codecs = [
+          ...(streamCodec ? ['video/mp4; codecs="' + streamCodec + '"'] : []),
           'video/mp4; codecs="avc1.42E01E"',
           'video/mp4; codecs="avc1.42c028"',
           'video/mp4; codecs="avc1.4D401E"',
@@ -765,18 +889,30 @@ async function setupMSE(video, meta) {
           return;
         }
         sourceBuffer = mediaSource.addSourceBuffer(mime);
-        sourceBuffer.mode = 'sequence';
+        // FFmpeg already supplies fMP4 fragments with valid decode timestamps.
+        // "sequence" regenerates those timestamps and can freeze playback after
+        // the first frame; retain the native fMP4 timeline instead.
+        sourceBuffer.mode = 'segments';
+        mediaSource.duration = Infinity;
         sourceBuffer.addEventListener('updateend', () => {
           mseReady = true;
           if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             const start = sourceBuffer.buffered.start(0);
-            if (end - start > 5) {
-              try { sourceBuffer.remove(start, end - 3); } catch(e) {}
+            // Keep playback at the live edge. A stalled MSE video can retain
+            // a readyState yet remain parked on an old buffered frame.
+            if (!livePaused && (video.paused || video.currentTime < end - 1)) {
+              try { video.currentTime = Math.max(start, end - 0.20); } catch(e) {}
+              video.play().catch(() => {});
+            }
+            // Retain enough history for decoder recovery before pruning.
+            if (end - start > 12) {
+              try { sourceBuffer.remove(start, end - 8); return; } catch(e) {}
             }
           }
           // resolve only after init segment is fully processed
-          if (!resolved) { resolved = true; resolve(); }
+          if (!resolved) { resolved = true; resolve(); return; }
+          appendPendingSegment();
         });
         sourceBuffer.addEventListener('error', (e) => {
           const errEl = document.getElementById('liveError');
@@ -794,7 +930,8 @@ async function setupMSE(video, meta) {
     mediaSource.addEventListener('sourceclose', () => {
       mseReady = false;
       mediaSource = null;
-      sourceBuffer = null;
+    sourceBuffer = null;
+    pendingSegments = [];
     });
     mediaSource.addEventListener('sourceended', () => {
       mseReady = false;
@@ -809,8 +946,35 @@ async function setupMSE(video, meta) {
   });
 }
 
+function setupNativeFmp4(video, deviceId) {
+  return new Promise((resolve, reject) => {
+    const url = API + '/stream-fmp4?device_id=' + encodeURIComponent(deviceId) +
+      (API_KEY ? '&api_key=' + encodeURIComponent(API_KEY) : '') + '&_=' + Date.now();
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      video.style.display = 'block';
+      document.getElementById('livePlaceholder').style.display = 'none';
+      document.getElementById('livePauseBtn').style.display = 'inline-block';
+      resolve();
+    };
+    video.onloadeddata = finish;
+    video.onplaying = finish;
+    video.onerror = () => {
+      if (!settled) reject(new Error('Native H.264 playback failed in this browser'));
+    };
+    video.src = url;
+    video.play().then(finish).catch(() => {});
+    setTimeout(() => {
+      if (!settled) reject(new Error('Native H.264 playback did not start within 12 seconds'));
+    }, 12000);
+  });
+}
+
 function stopLiveView() {
   liveDeviceId = '';
+  if (fpsInterval) { clearInterval(fpsInterval); fpsInterval = null; }
 
   if (eventSource) { eventSource.close(); eventSource = null; }
   if (mediaSource && mediaSource.readyState === 'open') {
@@ -819,7 +983,9 @@ function stopLiveView() {
   mediaSource = null;
   sourceBuffer = null;
   initSegment = null;
+  pendingSegments = [];
   mseReady = false;
+  livePaused = false;
 
   const video = document.getElementById('liveVideo');
   video.src = '';
@@ -833,11 +999,18 @@ function stopLiveView() {
 function togglePause() {
   const video = document.getElementById('liveVideo');
   const btn = document.getElementById('livePauseBtn');
-  if (!video.paused) {
+  if (!livePaused) {
+    livePaused = true;
     video.pause();
     btn.textContent = '▶ 播放';
   } else {
-    video.play();
+    livePaused = false;
+    if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+      const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+      const start = sourceBuffer.buffered.start(0);
+      try { video.currentTime = Math.max(start, end - 0.20); } catch(e) {}
+    }
+    video.play().catch(() => {});
     btn.textContent = '⏸ 暂停';
   }
 }

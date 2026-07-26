@@ -243,10 +243,11 @@ class TCPServer:
                         import base64 as _b64
                         from hermes.stream_manager import feed_stream
                         global _ts_bytes_total, _ts_pkt_total, _ts_last_report
-                        ts_data = _b64.b64decode(msg.get("data", ""))
+                        stream_data = _b64.b64decode(msg.get("data", ""))
+                        subtype = msg.get("subtype", "segment")
                         did = conn.device_id
                         # 计数器（诊断）
-                        _ts_bytes_total += len(ts_data)
+                        _ts_bytes_total += len(stream_data)
                         _ts_pkt_total += 1
                         now = time.time()
                         if now - _ts_last_report >= 2.0:
@@ -257,9 +258,9 @@ class TCPServer:
                             _ts_pkt_total = 0
                             _ts_last_report = now
                         # 线程池执行
-                        _stream_executor.submit(feed_stream, did, ts_data)
+                        _stream_executor.submit(feed_stream, did, stream_data, subtype)
                         if _ts_pkt_total == 1:
-                            logger.info("[BRIDGE] First TS chunk: %d bytes (decoded)", len(ts_data))
+                            logger.info("[BRIDGE] First fMP4 %s: %d bytes (decoded)", subtype, len(stream_data))
                     except Exception as e:
                         logger.warning("STREAM error: %s", e)
                     continue
@@ -503,7 +504,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             session.client_count += 1
             init_sent = False
-            last_seq = 0
+            # New viewers should start near the live edge, not replay the
+            # complete in-memory history (which adds several seconds of lag).
+            last_seq = session.live_start_sequence(history=3)
             try:
                 while session.active or len(session._segments) > 0:
                     if not init_sent:
@@ -548,7 +551,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             session.client_count += 1
-            last_seq = 0
+            # Keep only a brief keyframe warm-up for MSE, then follow live.
+            last_seq = session.live_start_sequence(history=3)
             try:
                 while session.active or len(session.chunks) > 0:
                     chunks = session.get_chunks_since(last_seq)
@@ -683,6 +687,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 tcp_server.send(action, params, timeout, device_id), loop
             )
             result = fut.result(timeout=min(timeout + 15, HTTP_REQUEST_TIMEOUT + timeout))
+            if action == "stream_stop" and device_id and not result.get("error"):
+                from hermes.stream_manager import stop_stream
+                stop_stream(device_id)
             self._json(result)
         except RuntimeError as e:
             logger.error("HTTP RuntimeError: %s", e, exc_info=True)

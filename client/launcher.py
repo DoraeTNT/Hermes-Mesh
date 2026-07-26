@@ -12,6 +12,19 @@ import os
 import sys
 
 
+def _setup_tcl_tk_runtime():
+    """Point tkinter at Tcl/Tk data embedded in a PyInstaller one-file app."""
+    if not getattr(sys, "frozen", False):
+        return
+    bundle_dir = getattr(sys, "_MEIPASS", "")
+    tcl_dir = os.path.join(bundle_dir, "_tcl_data")
+    tk_dir = os.path.join(bundle_dir, "_tk_data")
+    if os.path.isfile(os.path.join(tcl_dir, "init.tcl")):
+        os.environ["TCL_LIBRARY"] = tcl_dir
+    if os.path.isfile(os.path.join(tk_dir, "tk.tcl")):
+        os.environ["TK_LIBRARY"] = tk_dir
+
+
 def _get_exe_dir():
     """获取 exe 所在目录（兼容 PyInstaller onefile）"""
     if getattr(sys, "frozen", False):
@@ -58,6 +71,7 @@ def _hide_console():
 
 
 def main():
+    _setup_tcl_tk_runtime()
     exe_dir = _get_exe_dir()
 
     # 单实例锁：防止双击启动多个进程
